@@ -115,17 +115,20 @@ export default function GridEditor({ state, onChange }: Props) {
   };
 
   const regions = allRegions(state);
-  const canFuse = selection !== null && regionArea(selection) > 1;
+  // A resize from the 3D handles can shrink the grid under a live selection;
+  // treat any selection that no longer fits as cleared.
+  const sel =
+    selection && selection.c1 < state.cols && selection.r1 < state.rows ? selection : null;
+  const canFuse = sel !== null && regionArea(sel) > 1;
   const selectionIsSingleMerge =
-    selection !== null &&
+    sel !== null &&
     state.merges.some(
-      (m) =>
-        m.r0 === selection.r0 && m.c0 === selection.c0 && m.r1 === selection.r1 && m.c1 === selection.c1,
+      (m) => m.r0 === sel.r0 && m.c0 === sel.c0 && m.r1 === sel.r1 && m.c1 === sel.c1,
     );
   const canSplit =
-    selection !== null &&
+    sel !== null &&
     state.merges.some(
-      (m) => m.c0 <= selection.c1 && selection.c0 <= m.c1 && m.r0 <= selection.r1 && selection.r0 <= m.r1,
+      (m) => m.c0 <= sel.c1 && sel.c0 <= m.c1 && m.r0 <= sel.r1 && sel.r0 <= m.r1,
     );
 
   return (
@@ -135,7 +138,7 @@ export default function GridEditor({ state, onChange }: Props) {
           className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white enabled:hover:bg-sky-500 disabled:opacity-30"
           disabled={!canFuse || selectionIsSingleMerge}
           onClick={() => {
-            if (selection) onChange(fuse(state, selection));
+            if (sel) onChange(fuse(state, sel));
           }}
         >
           Fuse
@@ -144,8 +147,8 @@ export default function GridEditor({ state, onChange }: Props) {
           className="rounded-md bg-neutral-700 px-3 py-1.5 text-sm font-medium text-neutral-100 enabled:hover:bg-neutral-600 disabled:opacity-30"
           disabled={!canSplit}
           onClick={() => {
-            if (selection) {
-              onChange(split(state, selection));
+            if (sel) {
+              onChange(split(state, sel));
               setSelection(null);
             }
           }}
@@ -190,12 +193,12 @@ export default function GridEditor({ state, onChange }: Props) {
               </div>
             );
           })}
-          {selection && (
+          {sel && (
             <div
               className="pointer-events-none rounded-md border-2 border-sky-400 bg-sky-400/15"
               style={{
-                gridColumn: `${selection.c0 + 1} / ${selection.c1 + 2}`,
-                gridRow: `${selection.r0 + 1} / ${selection.r1 + 2}`,
+                gridColumn: `${sel.c0 + 1} / ${sel.c1 + 2}`,
+                gridRow: `${sel.r0 + 1} / ${sel.r1 + 2}`,
                 margin: -2,
               }}
             />

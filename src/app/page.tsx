@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import GridEditor from "@/components/GridEditor";
 import Sidebar from "@/components/Sidebar";
-import { GridState, allRegions, initialGrid } from "@/lib/grid";
+import { GridState, allRegions, initialGrid, resize } from "@/lib/grid";
 import { requestExport, requestMesh, downloadBlob } from "@/lib/cadClient";
 import { traySizeMm, type MeshData, type TrayParams, type TraySpec } from "@/lib/protocol";
 
@@ -132,7 +132,12 @@ export default function Home() {
         )}
       </aside>
       <main className="relative flex-1">
-        <Viewer mesh={mesh} cols={grid.cols} rows={grid.rows} />
+        <Viewer
+          mesh={mesh}
+          cols={grid.cols}
+          rows={grid.rows}
+          onResize={(c, r) => setGrid((g) => resize(g, c, r))}
+        />
         <div
           className={`absolute top-3 right-3 h-2.5 w-2.5 rounded-full ${STATUS_COLOR[status]}`}
           title={status === "error" ? (error ?? "error") : status === "init" ? "loading CAD kernel…" : status}
