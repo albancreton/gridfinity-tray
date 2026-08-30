@@ -1,0 +1,158 @@
+"use client";
+
+import { NumberField } from "@base-ui/react/number-field";
+import { Switch } from "@base-ui/react/switch";
+import type { TrayParams } from "@/lib/protocol";
+
+interface Props {
+  params: TrayParams;
+  onChange: (next: TrayParams) => void;
+  onExport: (kind: "stl" | "step") => void;
+  exporting: "stl" | "step" | null;
+}
+
+function Field({
+  label,
+  value,
+  min,
+  max,
+  step,
+  unit,
+  onValue,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  unit?: string;
+  onValue: (v: number) => void;
+}) {
+  return (
+    <label className="flex items-center justify-between gap-3">
+      <span className="text-sm text-neutral-300">{label}</span>
+      <NumberField.Root
+        value={value}
+        min={min}
+        max={max}
+        step={step}
+        onValueChange={(v) => {
+          if (v !== null) onValue(v);
+        }}
+        className="flex items-center"
+      >
+        <NumberField.Group className="flex items-center rounded-md border border-neutral-700 bg-neutral-800">
+          <NumberField.Decrement className="w-7 self-stretch text-neutral-400 hover:bg-neutral-700 hover:text-neutral-100">
+            −
+          </NumberField.Decrement>
+          <NumberField.Input className="w-14 border-x border-neutral-700 bg-transparent py-1 text-center text-sm tabular-nums text-neutral-100 outline-none" />
+          <NumberField.Increment className="w-7 self-stretch text-neutral-400 hover:bg-neutral-700 hover:text-neutral-100">
+            +
+          </NumberField.Increment>
+        </NumberField.Group>
+        {unit && <span className="ml-2 w-6 text-xs text-neutral-500">{unit}</span>}
+      </NumberField.Root>
+    </label>
+  );
+}
+
+function Toggle({
+  label,
+  checked,
+  onChecked,
+}: {
+  label: string;
+  checked: boolean;
+  onChecked: (v: boolean) => void;
+}) {
+  return (
+    <label className="flex items-center justify-between gap-3">
+      <span className="text-sm text-neutral-300">{label}</span>
+      <Switch.Root
+        checked={checked}
+        onCheckedChange={onChecked}
+        className="relative h-5 w-9 rounded-full bg-neutral-700 transition-colors data-[checked]:bg-sky-600"
+      >
+        <Switch.Thumb className="block h-4 w-4 translate-x-0.5 rounded-full bg-neutral-200 transition-transform data-[checked]:translate-x-[18px]" />
+      </Switch.Root>
+    </label>
+  );
+}
+
+const HEIGHT_PRESETS = [2, 3, 4, 6];
+
+export default function Sidebar({ params, onChange, onExport, exporting }: Props) {
+  const set = (patch: Partial<TrayParams>) => onChange({ ...params, ...patch });
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-3">
+        <Field
+          label="Height"
+          value={params.heightMm}
+          min={7}
+          max={140}
+          step={1}
+          unit="mm"
+          onValue={(v) => set({ heightMm: v })}
+        />
+        <div className="flex justify-end gap-1.5">
+          {HEIGHT_PRESETS.map((u) => (
+            <button
+              key={u}
+              className={`rounded px-2 py-0.5 text-xs tabular-nums ${
+                params.heightMm === u * 7
+                  ? "bg-sky-600 text-white"
+                  : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700"
+              }`}
+              onClick={() => set({ heightMm: u * 7 })}
+            >
+              {u}u
+            </button>
+          ))}
+        </div>
+        <Field
+          label="Wall thickness"
+          value={params.wall}
+          min={0.8}
+          max={4}
+          step={0.1}
+          unit="mm"
+          onValue={(v) => set({ wall: v })}
+        />
+        <Field
+          label="Floor thickness"
+          value={params.floor}
+          min={0}
+          max={10}
+          step={0.2}
+          unit="mm"
+          onValue={(v) => set({ floor: v })}
+        />
+        <Toggle label="Stacking lip" checked={params.lip} onChecked={(v) => set({ lip: v })} />
+        <Toggle
+          label="Magnet holes"
+          checked={params.magnets}
+          onChecked={(v) => set({ magnets: v })}
+        />
+      </div>
+
+      <div className="mt-2 flex gap-2">
+        <button
+          className="flex-1 rounded-md bg-emerald-600 px-3 py-2 text-sm font-medium text-white enabled:hover:bg-emerald-500 disabled:opacity-40"
+          disabled={exporting !== null}
+          onClick={() => onExport("stl")}
+        >
+          {exporting === "stl" ? "Exporting…" : "Export STL"}
+        </button>
+        <button
+          className="flex-1 rounded-md bg-neutral-700 px-3 py-2 text-sm font-medium text-neutral-100 enabled:hover:bg-neutral-600 disabled:opacity-40"
+          disabled={exporting !== null}
+          onClick={() => onExport("step")}
+        >
+          {exporting === "step" ? "Exporting…" : "Export STEP"}
+        </button>
+      </div>
+    </div>
+  );
+}
