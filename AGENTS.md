@@ -12,7 +12,8 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 
 Visual web app to design [gridfinity](https://gridfinity.xyz) trays and export them as
 **binary STL** and **real STEP** (ISO-10303-21). The user sizes a grid of 42mm units by
-dragging (max 12×12), selects cells and **fuses** them into larger compartments
+dragging (max 12×12, in the 2D panel or via the 3D handles), selects cells and **fuses**
+them into larger compartments
 (spreadsheet-style cell merging), tweaks parameters in a sidebar, and watches a live 3D
 preview. Everything is client-side; there is no backend.
 
@@ -34,7 +35,7 @@ react-three-fiber 9 + drei 10 · replicad 1.0 over OpenCASCADE WASM, in a web wo
 | `src/app/page.tsx` | State owner: `GridState` + `TrayParams` → `TraySpec`; 150ms-debounced, latest-wins mesh requests; localStorage persistence (`gridfinity-tray-v1`); export handler; size readout |
 | `src/components/GridEditor.tsx` | The 2D grid: drag-select, drag handles to resize, Fuse/Split buttons |
 | `src/components/Sidebar.tsx` | Base UI number fields + switches for params, export buttons |
-| `src/components/Viewer.tsx` | R3F canvas: mesh display (flat-shaded + edge lines), auto-fit camera, `MappedControls` (view controls) |
+| `src/components/Viewer.tsx` | R3F canvas: mesh display (flat-shaded + edge lines), `CameraRig` (eased camera flights via a shared goal ref), `ResizeHandles3D` (3D grid resize: top view + shadow preview, commit on release), `MappedControls` (view controls) |
 | `src/lib/grid.ts` | Pure grid model: `merges: Region[]` (only >1-cell merges stored; uncovered cells are implicit 1×1). `expandSelection` grows a rect over touched merges until stable — spreadsheet semantics |
 | `src/lib/protocol.ts` | Shared types (`TraySpec`, `MeshData`, worker messages) + shared mm constants + `traySizeMm()` |
 | `src/lib/viewMapping.ts` | Mouse-button → view-action presets (pure data). Active: `"fusion"` (middle=pan, shift+middle=orbit, wheel=zoom, left/right free) |
@@ -61,6 +62,35 @@ cols/rows/magnets), degraded preview during interaction.
 - Height param = bottom of feet → top of wall, lip excluded. `topZ = max(heightMm, 5.75) + lip·4.4`.
 - Verified: 2×1 @ h21+lip exports exactly 83.5 × 41.5 × 25.4.
 
+## 3D view conventions (Viewer.tsx)
+
+- **Corner-anchored world:** the tray's top-left cell corner is pinned to the origin;
+  columns grow +x, rows grow +z (row 0 at z 0..42, matching the 2D editor). Resizing
+  therefore never shifts existing geometry, and cell boundaries align with the ground
+  grid's 42mm sections. `TrayMesh` derives its y-offset from the **mesh's own bounds**
+  (not the grid props) so the stale mesh stays put while the worker rebuilds — don't
+  "simplify" it to `rows * PITCH`. (The worker keeps row 0 at its *top* y; the −90° X
+  rotation plus that offset produces the layout above.)
+- **Camera flights:** every programmatic move is a 0.65s eased flight toward
+  `goalRef.current`, interpolated in **orbit-angle space** (azimuth unwound the short
+  way, polar, radius, plus target lerp — all on one eased progress). Not a position
+  lerp and not a view-direction slerp: both concentrate the roll/heading twist at the
+  top-down pole, which reads as rotation lagging translation. Goals with
+  `sticky: true` (restoring the user's exact pre-drag pose) outrank the cols/rows
+  refit effect; any OrbitControls `start` (user orbit/pan/zoom) cancels the flight.
+- **Handle drag flow:** pointerdown disables controls, saves the current pose, and
+  flies to a top view with growth room right/bottom; moves use window-level listeners
+  and **absolute** snapping (the dragged edge goes to the grid line nearest the
+  pointer — stays correct while the camera is still flying); release commits once
+  (Escape cancels). The shadow persists after commit until a mesh **newer than the
+  commit-time one** arrives (`baseMesh` identity compare), masking the rebuild.
+- **Stable camera props:** the `Canvas` `camera` object lives in a `useState`
+  initializer and OrbitControls gets its target imperatively (not as a prop) — a
+  fresh object/array identity on re-render re-applies the prop and teleports the
+  camera / snaps the target mid-flight.
+- A grid shrink from the 3D handles can invalidate GridEditor's live selection; it
+  derives a `sel` guard instead of clearing state (no setState-in-effect).
+
 ## Gotchas learned the hard way
 
 - **WASM plumbing:** `scripts/copy-wasm.mjs` (predev/prebuild) copies
@@ -72,15 +102,21 @@ cols/rows/magnets), degraded preview during interaction.
   the action so the `viewMapping.ts` preset is the single source of truth. Don't set
   `mouseButtons` anywhere else. Controls are bound to R3F's wrapper div, not the canvas;
   drei defaults `enableDamping` on (we run `dampingFactor` 0.1).
-- **React hooks v6 lint rules** (`react-hooks/refs`, `react-hooks/set-state-in-effect`)
-  are **error-level** here: no ref access during render (no curried event handlers that
-  close over refs), and the localStorage-restore effect needs its existing
-  eslint-disable *block* (single-line disables don't suppress it).
+- **React hooks v6 lint rules** (`react-hooks/refs`, `react-hooks/set-state-in-effect`,
+  `react-hooks/immutability`) are **error-level** here: no ref access during render (no
+  curried event handlers that close over refs), the localStorage-restore effect needs
+  its existing eslint-disable *block* (single-line disables don't suppress it), and
+  hook-returned values can't be mutated in handlers — e.g. toggling
+  `controls.enabled` requires fetching controls at event time via
+  `useThree((s) => s.get)().controls`, not the hook value (method-call mutations
+  inside `useFrame` pass unnoticed).
 - **Hydration/persistence:** saving is gated on a `hydrated` **state** flag, not a ref —
   a ref updates synchronously and lets the mount-commit save clobber the stored design
   under StrictMode double-effects. Don't "simplify" this back to a ref.
 - **Dev hooks** (dev builds only): `window.__cad` (requestMesh/requestExport — parse the
-  STL blob to verify dimensions) and `window.__controls` (OrbitControls instance).
+  STL blob to verify dimensions), `window.__controls` (OrbitControls instance) and
+  `window.__scene` (THREE.Scene — the default camera is *not* parented to it, so
+  traversing from `__controls.object` finds nothing).
   Synthetic PointerEvents with fake pointerIds make OrbitControls' `releasePointerCapture`
   throw, leaving its internal drag state stuck (wheel stops working) — reload the page
   after event-driven tests; real mice are unaffected.
