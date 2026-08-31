@@ -134,9 +134,10 @@ export default function Home() {
       <main className="relative flex-1">
         <Viewer
           mesh={mesh}
-          cols={grid.cols}
-          rows={grid.rows}
+          grid={grid}
+          params={params}
           onResize={(c, r) => setGrid((g) => resize(g, c, r))}
+          onGridChange={setGrid}
         />
         <div
           className={`absolute top-3 right-3 h-2.5 w-2.5 rounded-full ${STATUS_COLOR[status]}`}

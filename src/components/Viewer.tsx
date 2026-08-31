@@ -5,8 +5,26 @@ import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber"
 import { OrbitControls, Grid, Html, useCursor } from "@react-three/drei";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
-import { CLEAR, PITCH, type MeshData } from "@/lib/protocol";
-import { clampUnits } from "@/lib/grid";
+import {
+  BASE_H,
+  CLEAR,
+  LIP_H,
+  PITCH,
+  type MeshData,
+  type Region,
+  type TrayParams,
+} from "@/lib/protocol";
+import {
+  type GridState,
+  boundingRect,
+  canFuseSelection,
+  canSplitSelection,
+  clampUnits,
+  expandSelection,
+  fuse,
+  regionAt,
+  split,
+} from "@/lib/grid";
 import {
   DEFAULT_MAPPING_ID,
   getViewMapping,
@@ -467,7 +485,260 @@ function ResizeHandles3D({
   );
 }
 
-function TrayMesh({ mesh }: { mesh: MeshData }) {
+// --- 3D cell selection -------------------------------------------------------
+
+/**
+ * Drag-select cells on the tray with the left button (only while the active
+ * view mapping leaves it free), with the 2D editor's spreadsheet semantics.
+ * Picking raycasts the visible tray mesh first — so clicks on tall walls land
+ * where the user points — and falls back to the ground plane off the tray.
+ */
+function CellSelector({
+  grid,
+  selection,
+  trayRef,
+  mappingId,
+  onSelect,
+  onRelease,
+}: {
+  grid: GridState;
+  selection: Region | null;
+  trayRef: React.RefObject<THREE.Mesh | null>;
+  mappingId: string;
+  onSelect: (sel: Region | null) => void;
+  /** Drag released: (x, y) is where the popup should appear, in canvas coords. */
+  onRelease: (x: number, y: number) => void;
+}) {
+  const camera = useThree((s) => s.camera);
+  const gl = useThree((s) => s.gl);
+  const detachRef = useRef<(() => void) | null>(null);
+  const [hover, setHover] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  useCursor(hover || dragging, "crosshair");
+
+  useEffect(() => () => detachRef.current?.(), []);
+
+  // Escape drops a standing selection (an in-progress drag has its own listener).
+  useEffect(() => {
+    if (!selection) return;
+    const key = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") onSelect(null);
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [selection, onSelect]);
+
+  const w = grid.cols * PITCH;
+  const d = grid.rows * PITCH;
+
+  const cellAt = (p: THREE.Vector3) => ({
+    r: Math.max(0, Math.min(grid.rows - 1, Math.floor(p.z / PITCH))),
+    c: Math.max(0, Math.min(grid.cols - 1, Math.floor(p.x / PITCH))),
+  });
+
+  const onDown = (e: ThreeEvent<PointerEvent>) => {
+    if (detachRef.current || e.nativeEvent.button !== 0) return;
+    const mapping = getViewMapping(mappingId);
+    const leftAction =
+      (e.nativeEvent.shiftKey ? mapping.shiftButtons?.left : undefined) ?? mapping.buttons.left;
+    if (leftAction !== "none") return;
+
+    const raycaster = new THREE.Raycaster();
+    const pick = (out: THREE.Vector3): boolean => {
+      const tray = trayRef.current;
+      if (tray) {
+        const hits = raycaster.intersectObject(tray, false);
+        if (hits.length > 0) {
+          out.copy(hits[0].point);
+          return true;
+        }
+      }
+      return groundPoint(raycaster.ray, out) !== null;
+    };
+
+    raycaster.ray.copy(e.ray);
+    const p = new THREE.Vector3();
+    if (!pick(p)) return;
+    // Clicks just outside the footprint still grab the nearest edge cell;
+    // anything farther out clears the selection instead.
+    const pad = PITCH * 0.6;
+    if (p.x < -pad || p.x > w + pad || p.z < -pad || p.z > d + pad) {
+      onSelect(null);
+      return;
+    }
+    e.stopPropagation();
+
+    const start = cellAt(p);
+    const anchor = regionAt(grid, start.r, start.c);
+    let last = expandSelection(grid, anchor);
+    onSelect(last);
+    setDragging(true);
+
+    const dom = gl.domElement;
+    const ndc = new THREE.Vector2();
+    const hit = new THREE.Vector3();
+
+    const move = (ev: PointerEvent) => {
+      if (ev.pointerId !== e.pointerId) return;
+      const rect = dom.getBoundingClientRect();
+      ndc.set(
+        ((ev.clientX - rect.left) / rect.width) * 2 - 1,
+        -((ev.clientY - rect.top) / rect.height) * 2 + 1,
+      );
+      raycaster.setFromCamera(ndc, camera);
+      if (!pick(hit)) return;
+      const pos = cellAt(hit);
+      const next = expandSelection(
+        grid,
+        boundingRect(anchor, { r0: pos.r, c0: pos.c, r1: pos.r, c1: pos.c }),
+      );
+      if (
+        next.r0 !== last.r0 ||
+        next.c0 !== last.c0 ||
+        next.r1 !== last.r1 ||
+        next.c1 !== last.c1
+      ) {
+        last = next;
+        onSelect(next);
+      }
+    };
+
+    const up = (ev: PointerEvent) => {
+      if (ev.pointerId !== e.pointerId) return;
+      detach();
+      // Anchor the popup above the cursor, clamped so it stays on the canvas.
+      const rect = dom.getBoundingClientRect();
+      onRelease(
+        Math.min(Math.max(ev.clientX - rect.left, 76), rect.width - 76),
+        Math.min(Math.max(ev.clientY - rect.top, 60), rect.height - 8),
+      );
+    };
+    const key = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        detach();
+        onSelect(null);
+      }
+    };
+    const detach = () => {
+      detachRef.current = null;
+      setDragging(false);
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      window.removeEventListener("keydown", key);
+    };
+    detachRef.current = detach;
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+    window.addEventListener("keydown", key);
+  };
+
+  return (
+    <group>
+      {/* invisible catch-all plane: starts selections near the tray, clears them elsewhere */}
+      <mesh
+        position={[0, -0.02, 0]}
+        rotation={[-Math.PI / 2, 0, 0]}
+        onPointerDown={onDown}
+        onPointerMove={(e) => {
+          const inside = e.point.x >= 0 && e.point.x <= w && e.point.z >= 0 && e.point.z <= d;
+          setHover((h) => (h === inside ? h : inside));
+        }}
+        onPointerOut={() => setHover(false)}
+      >
+        <planeGeometry args={[9000, 9000]} />
+        <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+      </mesh>
+    </group>
+  );
+}
+
+/**
+ * Lights the inside of the selected compartments by recoloring the tray's own
+ * fragments in-shader: everything within the selection's world box is tinted,
+ * except horizontal top-rim faces and the outer shell (fragments near the box
+ * boundary whose normal points outward — margin 4.3 covers the outer corner
+ * radius 3.75 + clearance). The box floor sits just under the pocket floor so
+ * the feet stay orange.
+ */
+function TrayMesh({
+  mesh,
+  sel,
+  params,
+  pickRef,
+}: {
+  mesh: MeshData;
+  sel: Region | null;
+  params: TrayParams;
+  pickRef?: React.Ref<THREE.Mesh>;
+}) {
+  const selUniforms = useRef({
+    uSelMin: { value: new THREE.Vector3() },
+    uSelMax: { value: new THREE.Vector3() },
+    uSelActive: { value: 0 },
+  });
+
+  useEffect(() => {
+    const u = selUniforms.current;
+    if (!sel) {
+      u.uSelActive.value = 0;
+      return;
+    }
+    // Mirror the worker's vertical layout (cad.worker.ts buildTray).
+    const topZ = Math.max(params.heightMm, BASE_H + 1) + (params.lip ? LIP_H : 0);
+    const floorZ = Math.min(BASE_H + Math.max(params.floor, 0), topZ - 0.5);
+    const topFaceY = Math.max(topZ - 0.8, floorZ + 0.6);
+    u.uSelMin.value.set(sel.c0 * PITCH, floorZ - 0.4, sel.r0 * PITCH);
+    u.uSelMax.value.set((sel.c1 + 1) * PITCH, topFaceY, (sel.r1 + 1) * PITCH);
+    u.uSelActive.value = 1;
+  }, [sel, params]);
+
+  const onBeforeCompile = useCallback(
+    (shader: Parameters<THREE.MeshStandardMaterial["onBeforeCompile"]>[0]) => {
+      const u = selUniforms.current;
+      shader.uniforms.uSelMin = u.uSelMin;
+      shader.uniforms.uSelMax = u.uSelMax;
+      shader.uniforms.uSelActive = u.uSelActive;
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          "#include <common>",
+          "#include <common>\nvarying vec3 vSelPos;\nvarying vec3 vSelNormal;",
+        )
+        .replace(
+          "#include <worldpos_vertex>",
+          "#include <worldpos_vertex>\n" +
+            "vSelPos = (modelMatrix * vec4(transformed, 1.0)).xyz;\n" +
+            "vSelNormal = normalize(mat3(modelMatrix) * objectNormal);",
+        );
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          "#include <common>",
+          "#include <common>\n" +
+            "varying vec3 vSelPos;\nvarying vec3 vSelNormal;\n" +
+            "uniform vec3 uSelMin;\nuniform vec3 uSelMax;\nuniform float uSelActive;",
+        )
+        .replace(
+          "vec4 diffuseColor = vec4( diffuse, opacity );",
+          `vec4 diffuseColor = vec4( diffuse, opacity );
+if (uSelActive > 0.5) {
+  vec3 n = normalize(vSelNormal);
+  bool inBox = vSelPos.x > uSelMin.x && vSelPos.x < uSelMax.x &&
+    vSelPos.z > uSelMin.z && vSelPos.z < uSelMax.z && vSelPos.y > uSelMin.y;
+  bool topFace = n.y > 0.9 && vSelPos.y > uSelMax.y;
+  bool outerX = abs(n.x) > 0.55 &&
+    ((vSelPos.x < uSelMin.x + 4.3 && n.x < 0.0) || (vSelPos.x > uSelMax.x - 4.3 && n.x > 0.0));
+  bool outerZ = abs(n.z) > 0.55 &&
+    ((vSelPos.z < uSelMin.z + 4.3 && n.z < 0.0) || (vSelPos.z > uSelMax.z - 4.3 && n.z > 0.0));
+  if (inBox && !topFace && !outerX && !outerZ && n.y > -0.5) {
+    diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.28, 0.39, 0.58), 0.92);
+  }
+}`,
+        );
+    },
+    [],
+  );
+
   const { geometry, edgeGeometry, offset } = useMemo(() => {
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(mesh.vertices, 3));
@@ -490,7 +761,7 @@ function TrayMesh({ mesh }: { mesh: MeshData }) {
   return (
     <group rotation={[-Math.PI / 2, 0, 0]}>
       <group position={offset}>
-        <mesh geometry={geometry} castShadow receiveShadow>
+        <mesh ref={pickRef} geometry={geometry} castShadow receiveShadow>
           <meshStandardMaterial
             color="#e07a3f"
             roughness={0.55}
@@ -498,6 +769,7 @@ function TrayMesh({ mesh }: { mesh: MeshData }) {
             polygonOffset
             polygonOffsetFactor={1}
             polygonOffsetUnits={1}
+            onBeforeCompile={onBeforeCompile}
           />
         </mesh>
         <lineSegments geometry={edgeGeometry}>
@@ -510,21 +782,41 @@ function TrayMesh({ mesh }: { mesh: MeshData }) {
 
 export default function Viewer({
   mesh,
-  cols,
-  rows,
+  grid,
+  params,
   onResize,
+  onGridChange,
   viewMappingId = DEFAULT_MAPPING_ID,
 }: {
   mesh: MeshData | null;
-  cols: number;
-  rows: number;
+  grid: GridState;
+  /** Needed to locate the compartment interiors for the selection tint. */
+  params: TrayParams;
   /** Commit a grid resize dragged from the 3D handles. */
   onResize: (cols: number, rows: number) => void;
+  /** Commit a fuse/split made from the 3D selection popup. */
+  onGridChange: (next: GridState) => void;
   /** Which button→action preset to use; a future settings UI feeds this. */
   viewMappingId?: string;
 }) {
+  const { cols, rows } = grid;
   const extent = Math.max(cols, rows) * PITCH;
   const goalRef = useRef<CameraGoal | null>(null);
+  const trayPickRef = useRef<THREE.Mesh | null>(null);
+  const [selection, setSelection] = useState<Region | null>(null);
+  const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
+  // A shrink (2D or 3D handles) can leave the selection out of bounds; treat as cleared.
+  const sel = selection && selection.c1 < cols && selection.r1 < rows ? selection : null;
+
+  const handleSelect = useCallback((next: Region | null) => {
+    setSelection(next);
+    setPopupPos(null);
+  }, []);
+  const handleRelease = useCallback((x: number, y: number) => setPopupPos({ x, y }), []);
+
+  const canFuse = sel !== null && canFuseSelection(grid, sel);
+  const canSplit = sel !== null && canSplitSelection(grid, sel);
+
   // Stable initial camera config: re-applying a fresh object on each render
   // would teleport the camera and defeat the CameraRig animation.
   const [initialCamera] = useState(() => ({
@@ -534,28 +826,66 @@ export default function Viewer({
     far: 5000,
   }));
   return (
-    <Canvas camera={initialCamera} dpr={[1, 2]}>
-      <color attach="background" args={["#101012"]} />
-      <CameraRig cols={cols} rows={rows} goalRef={goalRef} />
-      <ambientLight intensity={0.55} />
-      <directionalLight position={[150, 300, 200]} intensity={1.4} />
-      <directionalLight position={[-200, 150, -100]} intensity={0.4} />
-      <directionalLight position={[50, -200, 80]} intensity={0.5} />
-      {mesh && <TrayMesh mesh={mesh} />}
-      <ResizeHandles3D cols={cols} rows={rows} mesh={mesh} onResize={onResize} goalRef={goalRef} />
-      <Grid
-        position={[0, -0.05, 0]}
-        args={[10, 10]}
-        cellSize={PITCH / 2}
-        cellThickness={0.4}
-        cellColor="#2a2a2e"
-        sectionSize={PITCH}
-        sectionThickness={0.8}
-        sectionColor="#3d3d44"
-        fadeDistance={Math.max(extent * 6, 1200)}
-        infiniteGrid
-      />
-      <MappedControls mappingId={viewMappingId} />
-    </Canvas>
+    <div className="relative h-full w-full">
+      <Canvas camera={initialCamera} dpr={[1, 2]}>
+        <color attach="background" args={["#101012"]} />
+        <CameraRig cols={cols} rows={rows} goalRef={goalRef} />
+        <ambientLight intensity={0.55} />
+        <directionalLight position={[150, 300, 200]} intensity={1.4} />
+        <directionalLight position={[-200, 150, -100]} intensity={0.4} />
+        <directionalLight position={[50, -200, 80]} intensity={0.5} />
+        {mesh && <TrayMesh mesh={mesh} sel={sel} params={params} pickRef={trayPickRef} />}
+        <ResizeHandles3D cols={cols} rows={rows} mesh={mesh} onResize={onResize} goalRef={goalRef} />
+        <CellSelector
+          grid={grid}
+          selection={sel}
+          trayRef={trayPickRef}
+          mappingId={viewMappingId}
+          onSelect={handleSelect}
+          onRelease={handleRelease}
+        />
+        <Grid
+          position={[0, -0.05, 0]}
+          args={[10, 10]}
+          cellSize={PITCH / 2}
+          cellThickness={0.4}
+          cellColor="#2a2a2e"
+          sectionSize={PITCH}
+          sectionThickness={0.8}
+          sectionColor="#3d3d44"
+          fadeDistance={Math.max(extent * 6, 1200)}
+          infiniteGrid
+        />
+        <MappedControls mappingId={viewMappingId} />
+      </Canvas>
+      {sel && popupPos && (canFuse || canSplit) && (
+        <div
+          className="absolute z-10 flex animate-[popup-in_0.15s_ease-out] items-center gap-1.5 rounded-lg border border-neutral-700 bg-neutral-900/95 p-1.5 shadow-xl shadow-black/40 backdrop-blur"
+          style={{ left: popupPos.x, top: popupPos.y - 12, transform: "translate(-50%, -100%)" }}
+        >
+          <button
+            className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white enabled:hover:bg-sky-500 disabled:opacity-30"
+            disabled={!canFuse}
+            onClick={() => {
+              onGridChange(fuse(grid, sel));
+              handleSelect(null);
+            }}
+          >
+            Fuse
+          </button>
+          <button
+            className="rounded-md bg-neutral-700 px-3 py-1.5 text-sm font-medium text-neutral-100 enabled:hover:bg-neutral-600 disabled:opacity-30"
+            disabled={!canSplit}
+            onClick={() => {
+              onGridChange(split(grid, sel));
+              handleSelect(null);
+            }}
+          >
+            Split
+          </button>
+          <div className="absolute -bottom-1 left-1/2 h-2 w-2 -translate-x-1/2 rotate-45 border-r border-b border-neutral-700 bg-neutral-900" />
+        </div>
+      )}
+    </div>
   );
 }

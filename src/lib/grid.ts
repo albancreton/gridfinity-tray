@@ -35,6 +35,37 @@ export function regionArea(r: Region): number {
   return (r.r1 - r.r0 + 1) * (r.c1 - r.c0 + 1);
 }
 
+/** The merge covering a cell, or the cell itself as a 1×1 region. */
+export function regionAt(state: GridState, r: number, c: number): Region {
+  for (const m of state.merges) {
+    if (r >= m.r0 && r <= m.r1 && c >= m.c0 && c <= m.c1) return m;
+  }
+  return { r0: r, c0: c, r1: r, c1: c };
+}
+
+export function boundingRect(a: Region, b: Region): Region {
+  return {
+    r0: Math.min(a.r0, b.r0),
+    c0: Math.min(a.c0, b.c0),
+    r1: Math.max(a.r1, b.r1),
+    c1: Math.max(a.c1, b.c1),
+  };
+}
+
+/** More than one cell selected and not already exactly one merge. */
+export function canFuseSelection(state: GridState, sel: Region): boolean {
+  return (
+    regionArea(sel) > 1 &&
+    !state.merges.some(
+      (m) => m.r0 === sel.r0 && m.c0 === sel.c0 && m.r1 === sel.r1 && m.c1 === sel.c1,
+    )
+  );
+}
+
+export function canSplitSelection(state: GridState, sel: Region): boolean {
+  return state.merges.some((m) => intersects(m, sel));
+}
+
 export function normalizeRect(r0: number, c0: number, r1: number, c1: number): Region {
   return {
     r0: Math.min(r0, r1),

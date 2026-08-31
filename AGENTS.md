@@ -90,6 +90,26 @@ cols/rows/magnets), degraded preview during interaction.
   camera / snaps the target mid-flight.
 - A grid shrink from the 3D handles can invalidate GridEditor's live selection; it
   derives a `sel` guard instead of clearing state (no setState-in-effect).
+- **3D cell selection (`CellSelector`):** left-drag on the tray selects cells with the
+  2D editor's spreadsheet semantics — the shared helpers (`regionAt`, `boundingRect`,
+  `expandSelection`, `canFuseSelection`, `canSplitSelection`) live in `grid.ts`, used by
+  both editors. Only active while the view mapping leaves the left button free
+  (`buttons.left === "none"`). Picking raycasts the **visible tray mesh** first (via
+  `pickRef` on `TrayMesh`), falling back to the ground plane — so a click on a tall wall
+  selects the cell the cursor is on, not the occluded one behind it. An invisible
+  catch-all plane starts selections near the footprint (0.6-pitch forgiveness pad) and
+  clears them elsewhere. Releasing shows a Fuse/Split popup: a DOM overlay in Viewer's
+  wrapper div anchored above the cursor (clamped to the canvas, `popup-in` keyframes in
+  globals.css). Fuse, split, Escape, and empty-ground clicks all clear the selection
+  and popup. Viewer guards its selection against shrinks like GridEditor does.
+- **Selection visual = interior tint, not an overlay:** `TrayMesh` recolors the tray's
+  own fragments via `onBeforeCompile` uniforms — inside the selection's world box, minus
+  horizontal top-rim faces (`n.y > 0.9` above `topZ − 0.8`) and outer-shell fragments
+  (outward normal within 4.3mm of a box side, covering corner radius 3.75 + clearance).
+  The box floor sits just under the pocket floor so feet stay orange. Its vertical
+  bounds recompute the worker's `topZ`/`floorZ` formulas from `TrayParams` — keep them
+  in sync with `cad.worker.ts`. Uniforms live in a ref and are mutated in an effect
+  (never recreate the material; the shader patch compiles once).
 
 ## Gotchas learned the hard way
 

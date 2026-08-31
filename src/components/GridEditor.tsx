@@ -6,10 +6,14 @@ import {
   GridState,
   MAX_UNITS,
   allRegions,
+  boundingRect,
+  canFuseSelection,
+  canSplitSelection,
   expandSelection,
   fuse,
   normalizeRect,
   regionArea,
+  regionAt,
   regionLabel,
   resize,
   split,
@@ -21,22 +25,6 @@ const PANEL = 288; // inner width available for the grid
 interface Props {
   state: GridState;
   onChange: (next: GridState) => void;
-}
-
-function regionAt(state: GridState, r: number, c: number): Region {
-  for (const m of state.merges) {
-    if (r >= m.r0 && r <= m.r1 && c >= m.c0 && c <= m.c1) return m;
-  }
-  return { r0: r, c0: c, r1: r, c1: c };
-}
-
-function boundingRect(a: Region, b: Region): Region {
-  return {
-    r0: Math.min(a.r0, b.r0),
-    c0: Math.min(a.c0, b.c0),
-    r1: Math.max(a.r1, b.r1),
-    c1: Math.max(a.c1, b.c1),
-  };
 }
 
 export default function GridEditor({ state, onChange }: Props) {
@@ -119,24 +107,15 @@ export default function GridEditor({ state, onChange }: Props) {
   // treat any selection that no longer fits as cleared.
   const sel =
     selection && selection.c1 < state.cols && selection.r1 < state.rows ? selection : null;
-  const canFuse = sel !== null && regionArea(sel) > 1;
-  const selectionIsSingleMerge =
-    sel !== null &&
-    state.merges.some(
-      (m) => m.r0 === sel.r0 && m.c0 === sel.c0 && m.r1 === sel.r1 && m.c1 === sel.c1,
-    );
-  const canSplit =
-    sel !== null &&
-    state.merges.some(
-      (m) => m.c0 <= sel.c1 && sel.c0 <= m.c1 && m.r0 <= sel.r1 && sel.r0 <= m.r1,
-    );
+  const canFuse = sel !== null && canFuseSelection(state, sel);
+  const canSplit = sel !== null && canSplitSelection(state, sel);
 
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center gap-2">
         <button
           className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white enabled:hover:bg-sky-500 disabled:opacity-30"
-          disabled={!canFuse || selectionIsSingleMerge}
+          disabled={!canFuse}
           onClick={() => {
             if (sel) onChange(fuse(state, sel));
           }}
