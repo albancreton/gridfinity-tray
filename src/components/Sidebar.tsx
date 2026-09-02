@@ -3,10 +3,13 @@
 import { NumberField } from "@base-ui/react/number-field";
 import { Switch } from "@base-ui/react/switch";
 import type { TrayParams } from "@/lib/protocol";
+import type { ViewSettings } from "@/lib/viewSettings";
 
 interface Props {
   params: TrayParams;
   onChange: (next: TrayParams) => void;
+  view: ViewSettings;
+  onViewChange: (next: ViewSettings) => void;
   onExport: (kind: "stl" | "step") => void;
   exporting: "stl" | "step" | null;
 }
@@ -81,8 +84,16 @@ function Toggle({
 
 const HEIGHT_PRESETS = [2, 3, 4, 6];
 
-export default function Sidebar({ params, onChange, onExport, exporting }: Props) {
+export default function Sidebar({
+  params,
+  onChange,
+  view,
+  onViewChange,
+  onExport,
+  exporting,
+}: Props) {
   const set = (patch: Partial<TrayParams>) => onChange({ ...params, ...patch });
+  const setView = (patch: Partial<ViewSettings>) => onViewChange({ ...view, ...patch });
 
   return (
     <div className="flex flex-col gap-4">
@@ -135,6 +146,27 @@ export default function Sidebar({ params, onChange, onExport, exporting }: Props
           checked={params.magnets}
           onChecked={(v) => set({ magnets: v })}
         />
+      </div>
+
+      <hr className="border-neutral-800" />
+
+      <div className="flex flex-col gap-3">
+        <Toggle
+          label="Printed look"
+          checked={view.printLook}
+          onChecked={(v) => setView({ printLook: v })}
+        />
+        {view.printLook && (
+          <Field
+            label="Layer height"
+            value={view.layerHeight}
+            min={0.08}
+            max={0.4}
+            step={0.04}
+            unit="mm"
+            onValue={(v) => setView({ layerHeight: v })}
+          />
+        )}
       </div>
 
       <div className="mt-2 flex gap-2">

@@ -7,6 +7,7 @@ import Sidebar from "@/components/Sidebar";
 import { GridState, allRegions, initialGrid, resize } from "@/lib/grid";
 import { requestExport, requestMesh, downloadBlob } from "@/lib/cadClient";
 import { traySizeMm, type MeshData, type TrayParams, type TraySpec } from "@/lib/protocol";
+import { DEFAULT_VIEW, type ViewSettings } from "@/lib/viewSettings";
 
 const Viewer = dynamic(() => import("@/components/Viewer"), { ssr: false });
 
@@ -58,13 +59,17 @@ const DEFAULT_PARAMS: TrayParams = {
   magnets: false,
 };
 
-function loadSaved(): { grid: GridState; params: TrayParams } | null {
+function loadSaved(): { grid: GridState; params: TrayParams; view: ViewSettings } | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
     const data = JSON.parse(raw);
     if (!data.grid?.cols || !data.params) return null;
-    return { grid: data.grid, params: { ...DEFAULT_PARAMS, ...data.params } };
+    return {
+      grid: data.grid,
+      params: { ...DEFAULT_PARAMS, ...data.params },
+      view: { ...DEFAULT_VIEW, ...(data.view ?? {}) },
+    };
   } catch {
     return null;
   }
@@ -73,6 +78,7 @@ function loadSaved(): { grid: GridState; params: TrayParams } | null {
 export default function Home() {
   const [grid, setGrid] = useState<GridState>(initialGrid);
   const [params, setParams] = useState<TrayParams>(DEFAULT_PARAMS);
+  const [view, setView] = useState<ViewSettings>(DEFAULT_VIEW);
   // Saving is gated on state (not a ref) so the effect order during the mount
   // commit can't overwrite the stored design with the defaults before the
   // restore re-render happens.
@@ -84,6 +90,7 @@ export default function Home() {
     if (saved) {
       setGrid(saved.grid);
       setParams(saved.params);
+      setView(saved.view);
     }
     setHydrated(true);
     /* eslint-enable react-hooks/set-state-in-effect */
@@ -92,9 +99,9 @@ export default function Home() {
   useEffect(() => {
     if (!hydrated) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ grid, params }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ grid, params, view }));
     } catch {}
-  }, [hydrated, grid, params]);
+  }, [hydrated, grid, params, view]);
   const [exporting, setExporting] = useState<"stl" | "step" | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
@@ -126,7 +133,14 @@ export default function Home() {
       <aside className="flex w-80 shrink-0 flex-col gap-5 overflow-y-auto border-r border-neutral-800 p-4">
         <GridEditor state={grid} onChange={setGrid} />
         <hr className="border-neutral-800" />
-        <Sidebar params={params} onChange={setParams} onExport={handleExport} exporting={exporting} />
+        <Sidebar
+          params={params}
+          onChange={setParams}
+          view={view}
+          onViewChange={setView}
+          onExport={handleExport}
+          exporting={exporting}
+        />
         {(error || exportError) && (
           <p className="text-xs break-words text-red-400">{error ?? exportError}</p>
         )}
@@ -138,6 +152,7 @@ export default function Home() {
           params={params}
           onResize={(c, r) => setGrid((g) => resize(g, c, r))}
           onGridChange={setGrid}
+          view={view}
         />
         <div
           className={`absolute top-3 right-3 h-2.5 w-2.5 rounded-full ${STATUS_COLOR[status]}`}

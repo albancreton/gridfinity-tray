@@ -9,6 +9,7 @@ import {
 import {
   PITCH,
   CLEAR,
+  R_OUT,
   BASE_H,
   LIP_H,
   type TraySpec,
@@ -17,7 +18,6 @@ import {
 } from "../lib/protocol";
 
 // --- Gridfinity spec constants (mm) ---
-const R_OUT = 3.75; // outer corner radius
 // Base foot profile, bottom to top: 0.8 chamfer, 1.8 straight, 2.15 chamfer (total BASE_H)
 const FOOT_TOP = PITCH - 2 * CLEAR; // 41.5, per unit
 const MAGNET_D = 6.5;

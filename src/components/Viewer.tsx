@@ -10,12 +10,15 @@ import {
   CLEAR,
   LIP_H,
   PITCH,
+  R_OUT,
   type MeshData,
   type Region,
   type TrayParams,
 } from "@/lib/protocol";
 import {
   type GridState,
+  MAX_UNITS,
+  allRegions,
   boundingRect,
   canFuseSelection,
   canSplitSelection,
@@ -31,6 +34,7 @@ import {
   type MouseButton,
   type ViewAction,
 } from "@/lib/viewMapping";
+import { NOZZLE_LINE_W, type ViewSettings } from "@/lib/viewSettings";
 
 const ACTION_TO_MOUSE: Record<ViewAction, THREE.MOUSE | undefined> = {
   orbit: THREE.MOUSE.ROTATE,
@@ -654,33 +658,102 @@ function CellSelector({
   );
 }
 
+/** Cell → compartment lookup for the printed-look shader (RGBA8 = c0, r0, c1, r1). */
+function makeRegionTexture(): THREE.DataTexture {
+  const tex = new THREE.DataTexture(
+    new Uint8Array(MAX_UNITS * MAX_UNITS * 4),
+    MAX_UNITS,
+    MAX_UNITS,
+    THREE.RGBAFormat,
+    THREE.UnsignedByteType,
+  );
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
 /**
- * Lights the inside of the selected compartments by recoloring the tray's own
- * fragments in-shader: everything within the selection's world box is tinted,
- * except horizontal top-rim faces and the outer shell (fragments near the box
- * boundary whose normal points outward — margin 4.3 covers the outer corner
- * radius 3.75 + clearance). The box floor sits just under the pocket floor so
- * the feet stay orange.
+ * The tray surface: a standard material with two shader patches (compiled once;
+ * everything dynamic goes through uniforms mutated in effects).
+ *
+ * Selection tint — lights the inside of the selected compartments by recoloring
+ * the tray's own fragments: everything within the selection's world box is
+ * tinted, except horizontal top-rim faces and the outer shell (fragments near
+ * the box boundary whose normal points outward — margin 4.3 covers the outer
+ * corner radius 3.75 + clearance). The box floor sits just under the pocket
+ * floor so the feet stay orange.
+ *
+ * Printed look — an analytic FDM height field bumps the normal per fragment:
+ * layer beads stacked along world y (print height; the bed is y=0) on walls and
+ * chamfers, diagonal top-fill beads on up/down-facing faces, blended by |n.y|.
+ * Each pattern fades out once its period spans under ~2px so zooming out
+ * returns to the flat look instead of moiré. Geometry is untouched (OCC emits
+ * two triangles per flat face), so this must stay per-fragment.
  */
 function TrayMesh({
   mesh,
   sel,
+  grid,
   params,
+  view,
   pickRef,
 }: {
   mesh: MeshData;
   sel: Region | null;
+  /** Compartment layout — the printed look derives its perimeter loops from it. */
+  grid: GridState;
   params: TrayParams;
+  view: ViewSettings;
   pickRef?: React.Ref<THREE.Mesh>;
 }) {
-  const selUniforms = useRef({
+  const uniforms = useRef({
     uSelMin: { value: new THREE.Vector3() },
     uSelMax: { value: new THREE.Vector3() },
     uSelActive: { value: 0 },
+    uPrint: { value: 0 },
+    uLayerH: { value: 0.2 },
+    uLineW: { value: NOZZLE_LINE_W },
+    uFillAngle: { value: Math.PI / 4 },
+    /** Bead relief as a fraction of its period; drives the normal tilt. */
+    uRelief: { value: 0.22 },
+    /** How much darker a seam gets than a bead crest. */
+    uSeamShade: { value: 0.28 },
+    /** 12×12 cell → compartment rect (c0, r0, c1, r1) as bytes; see the grid effect. */
+    uRegions: { value: makeRegionTexture() },
+    uGrid: { value: new THREE.Vector2(1, 1) },
+    uWall: { value: 1.2 },
+    /** Perimeter loops drawn around each flat top region before the fill starts. */
+    uPerims: { value: 2 },
   });
+  useEffect(() => {
+    const tex = uniforms.current.uRegions.value;
+    return () => tex.dispose();
+  }, []);
 
   useEffect(() => {
-    const u = selUniforms.current;
+    const u = uniforms.current;
+    const data = u.uRegions.value.image.data as Uint8Array;
+    data.fill(0);
+    for (const reg of allRegions(grid)) {
+      for (let r = reg.r0; r <= reg.r1; r++) {
+        for (let c = reg.c0; c <= reg.c1; c++) {
+          const i = (r * MAX_UNITS + c) * 4;
+          data[i] = reg.c0;
+          data[i + 1] = reg.r0;
+          data[i + 2] = reg.c1;
+          data[i + 3] = reg.r1;
+        }
+      }
+    }
+    u.uRegions.value.needsUpdate = true;
+    u.uGrid.value.set(grid.cols, grid.rows);
+    u.uWall.value = params.wall;
+  }, [grid, params.wall]);
+
+  useEffect(() => {
+    const u = uniforms.current;
     if (!sel) {
       u.uSelActive.value = 0;
       return;
@@ -694,45 +767,179 @@ function TrayMesh({
     u.uSelActive.value = 1;
   }, [sel, params]);
 
+  useEffect(() => {
+    const u = uniforms.current;
+    u.uPrint.value = view.printLook ? 1 : 0;
+    u.uLayerH.value = Math.max(view.layerHeight, 0.04);
+    if (process.env.NODE_ENV === "development") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (window as any).__printUniforms = u;
+    }
+  }, [view]);
+
   const onBeforeCompile = useCallback(
     (shader: Parameters<THREE.MeshStandardMaterial["onBeforeCompile"]>[0]) => {
-      const u = selUniforms.current;
-      shader.uniforms.uSelMin = u.uSelMin;
-      shader.uniforms.uSelMax = u.uSelMax;
-      shader.uniforms.uSelActive = u.uSelActive;
+      Object.assign(shader.uniforms, uniforms.current);
       shader.vertexShader = shader.vertexShader
         .replace(
           "#include <common>",
-          "#include <common>\nvarying vec3 vSelPos;\nvarying vec3 vSelNormal;",
+          "#include <common>\nvarying vec3 vWorldPos;\nvarying vec3 vWorldNormal;",
         )
         .replace(
           "#include <worldpos_vertex>",
           "#include <worldpos_vertex>\n" +
-            "vSelPos = (modelMatrix * vec4(transformed, 1.0)).xyz;\n" +
-            "vSelNormal = normalize(mat3(modelMatrix) * objectNormal);",
+            "vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;\n" +
+            "vWorldNormal = normalize(mat3(modelMatrix) * objectNormal);",
         );
       shader.fragmentShader = shader.fragmentShader
         .replace(
           "#include <common>",
-          "#include <common>\n" +
-            "varying vec3 vSelPos;\nvarying vec3 vSelNormal;\n" +
-            "uniform vec3 uSelMin;\nuniform vec3 uSelMax;\nuniform float uSelActive;",
+          `#include <common>
+varying vec3 vWorldPos;
+varying vec3 vWorldNormal;
+uniform vec3 uSelMin;
+uniform vec3 uSelMax;
+uniform float uSelActive;
+uniform float uPrint;
+uniform float uLayerH;
+uniform float uLineW;
+uniform float uFillAngle;
+uniform float uRelief;
+uniform float uSeamShade;
+uniform sampler2D uRegions;
+uniform vec2 uGrid;
+uniform float uWall;
+uniform float uPerims;
+#define FDM_PITCH ${PITCH}.0
+#define FDM_CLEAR ${CLEAR}
+#define FDM_ROUT ${R_OUT}
+// Signed distance to the rounded rectangle [a,b] (corner radius r), and its gradient.
+float sdRoundRect(vec2 p, vec2 a, vec2 b, float r, out vec2 grad) {
+  vec2 d = p - 0.5 * (a + b);
+  vec2 q = abs(d) - (0.5 * (b - a) - vec2(r));
+  vec2 s = vec2(d.x < 0.0 ? -1.0 : 1.0, d.y < 0.0 ? -1.0 : 1.0);
+  if (q.x > 0.0 && q.y > 0.0) {
+    float l = length(q);
+    grad = s * q / max(l, 1e-6);
+    return l - r;
+  }
+  if (q.x > q.y) { grad = vec2(s.x, 0.0); return q.x - r; }
+  grad = vec2(0.0, s.y);
+  return q.y - r;
+}
+// Pocket outline of the compartment covering the given grid cell — mirrors the
+// pocket rect + corner radius in cad.worker.ts buildTray; keep them in sync.
+void pocketRect(ivec2 cell, out vec2 a, out vec2 b, out float r) {
+  vec4 reg = floor(texelFetch(uRegions, cell, 0) * 255.0 + 0.5); // c0, r0, c1, r1
+  float hw = 0.5 * uWall;
+  float edge = FDM_CLEAR + uWall;
+  a = vec2(FDM_PITCH * reg.x + (reg.x == 0.0 ? edge : hw),
+           FDM_PITCH * reg.y + (reg.y == 0.0 ? edge : hw));
+  b = vec2(FDM_PITCH * (reg.z + 1.0) - (reg.z == uGrid.x - 1.0 ? edge : hw),
+           FDM_PITCH * (reg.w + 1.0) - (reg.w == uGrid.y - 1.0 ? edge : hw));
+  vec2 size = b - a;
+  r = max(0.4, min(min(FDM_ROUT - uWall, 0.5 * size.x - 0.1), 0.5 * size.y - 0.1));
+}
+// Distance from an up-facing fragment (world xz) to the nearest edge of the flat
+// region it sits on — a pocket outline or the tray's outer outline — and the
+// in-plane direction pointing away from that edge. Checks the fragment's cell
+// and the three neighbours toward the nearest grid corner, which covers every
+// wall top and junction.
+float topEdgeDist(vec2 p, out vec2 away) {
+  vec2 cellF = clamp(floor(p / FDM_PITCH), vec2(0.0), uGrid - 1.0);
+  vec2 f = p / FDM_PITCH - cellF;
+  vec2 nb = vec2(f.x < 0.5 ? -1.0 : 1.0, f.y < 0.5 ? -1.0 : 1.0);
+  float best = 1e9;
+  away = vec2(1.0, 0.0);
+  for (int i = 0; i < 4; i++) {
+    vec2 cf = clamp(cellF + vec2(float(i & 1), float(i >> 1)) * nb, vec2(0.0), uGrid - 1.0);
+    vec2 a, b, g;
+    float r;
+    pocketRect(ivec2(cf), a, b, r);
+    float sd = sdRoundRect(p, a, b, r, g);
+    float d = abs(sd);
+    if (d < best) { best = d; away = sd < 0.0 ? -g : g; }
+  }
+  vec2 g;
+  float dOut = -sdRoundRect(p, vec2(FDM_CLEAR), uGrid * FDM_PITCH - FDM_CLEAR, FDM_ROUT, g);
+  if (dOut < best) { best = dOut; away = -g; }
+  return best;
+}
+// Bead cross-section over one period, u in [-1,1] (crest at 0, seams at ±1):
+// a half-disc up close, morphing (s→1) into a pure cosine as the period
+// shrinks on screen — the disc's seam harmonics alias long before its period.
+float fdmProfile(float u, float s) {
+  float disc = sqrt(max(1.0 - u * u, 0.0));
+  float cosb = 0.5 + 0.5 * cos(PI * u);
+  return mix(disc, cosb, s);
+}
+// Slope per unit u; the disc's is clamped where it goes vertical at the seams.
+float fdmSlope(float u, float s) {
+  float disc = -u / max(sqrt(max(1.0 - u * u, 0.0)), 0.25);
+  float cosb = -0.5 * PI * sin(PI * u);
+  return mix(disc, cosb, s);
+}
+float fdmMean(float s) { return mix(0.785, 0.5, s); }
+float fdmHash(float x) { return fract(sin(x * 12.9898) * 43758.5453); }`,
         )
         .replace(
           "vec4 diffuseColor = vec4( diffuse, opacity );",
           `vec4 diffuseColor = vec4( diffuse, opacity );
 if (uSelActive > 0.5) {
-  vec3 n = normalize(vSelNormal);
-  bool inBox = vSelPos.x > uSelMin.x && vSelPos.x < uSelMax.x &&
-    vSelPos.z > uSelMin.z && vSelPos.z < uSelMax.z && vSelPos.y > uSelMin.y;
-  bool topFace = n.y > 0.9 && vSelPos.y > uSelMax.y;
+  vec3 n = normalize(vWorldNormal);
+  bool inBox = vWorldPos.x > uSelMin.x && vWorldPos.x < uSelMax.x &&
+    vWorldPos.z > uSelMin.z && vWorldPos.z < uSelMax.z && vWorldPos.y > uSelMin.y;
+  bool topFace = n.y > 0.9 && vWorldPos.y > uSelMax.y;
   bool outerX = abs(n.x) > 0.55 &&
-    ((vSelPos.x < uSelMin.x + 4.3 && n.x < 0.0) || (vSelPos.x > uSelMax.x - 4.3 && n.x > 0.0));
+    ((vWorldPos.x < uSelMin.x + 4.3 && n.x < 0.0) || (vWorldPos.x > uSelMax.x - 4.3 && n.x > 0.0));
   bool outerZ = abs(n.z) > 0.55 &&
-    ((vSelPos.z < uSelMin.z + 4.3 && n.z < 0.0) || (vSelPos.z > uSelMax.z - 4.3 && n.z > 0.0));
+    ((vWorldPos.z < uSelMin.z + 4.3 && n.z < 0.0) || (vWorldPos.z > uSelMax.z - 4.3 && n.z > 0.0));
   if (inBox && !topFace && !outerX && !outerZ && n.y > -0.5) {
     diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.28, 0.39, 0.58), 0.92);
   }
+}`,
+        )
+        .replace(
+          "#include <normal_fragment_maps>",
+          `#include <normal_fragment_maps>
+if (uPrint > 0.5) {
+  vec3 nw = normalize(vWorldNormal);
+  // Layers repeat along world y; top fill repeats along the fill direction in xz.
+  float ly = vWorldPos.y / uLayerH;
+  // Top pattern: uPerims loops hugging the region's edge, diagonal fill inside.
+  // Only up-facing fragments pay for the distance field (feet bottoms get fill).
+  vec2 dir = vec2(cos(uFillAngle), sin(uFillAngle));
+  vec2 away = dir;
+  float dEdge = 1e9;
+  if (nw.y > 0.5) dEdge = topEdgeDist(vWorldPos.xz, away);
+  bool perim = dEdge < uPerims * uLineW;
+  vec2 tdir = perim ? away : dir;
+  float ls = (perim ? dEdge : dot(vWorldPos.xz, dir)) / uLineW;
+  float uy = 2.0 * fract(ly) - 1.0;
+  float us = 2.0 * fract(ls) - 1.0;
+  // Screen footprint of each pattern in periods per pixel: soften the profile
+  // to a cosine from ~12px/period down, fade it out entirely by ~1.7px/period.
+  float fwY = fwidth(ly);
+  float fwS = fwidth(ls);
+  float sY = smoothstep(0.08, 0.3, fwY);
+  float sS = smoothstep(0.08, 0.3, fwS);
+  float aaY = 1.0 - smoothstep(0.35, 0.6, fwY);
+  float aaS = 1.0 - smoothstep(0.35, 0.6, fwS);
+  float wTop = smoothstep(0.7, 0.95, abs(nw.y));
+  // World-space gradient of the height field: relief = uRelief·period and
+  // d(bead)/d(world) = slope(u)·2/period, so the period cancels out.
+  float k = 2.0 * uRelief;
+  vec3 gY = vec3(0.0, fdmSlope(uy, sY) * k * aaY, 0.0);
+  vec3 gS = vec3(tdir.x, 0.0, tdir.y) * (fdmSlope(us, sS) * k * aaS);
+  vec3 g = mix(gY, gS, wTop);
+  vec3 np = normalize(nw - (g - nw * dot(nw, g)));
+  normal = normalize((viewMatrix * vec4(np, 0.0)).xyz);
+  // Seams sit in shadow; a touch of per-layer variation breaks the regularity.
+  float hY = mix(fdmMean(sY), fdmProfile(uy, sY), aaY);
+  float hS = mix(fdmMean(sS), fdmProfile(us, sS), aaS);
+  float h = mix(hY, hS, wTop);
+  float layerVar = (fdmHash(floor(ly)) - 0.5) * 0.08 * aaY * (1.0 - wTop);
+  diffuseColor.rgb *= (1.0 - uSeamShade * (1.0 - h)) * (1.0 + layerVar);
 }`,
         );
     },
@@ -786,6 +993,7 @@ export default function Viewer({
   params,
   onResize,
   onGridChange,
+  view,
   viewMappingId = DEFAULT_MAPPING_ID,
 }: {
   mesh: MeshData | null;
@@ -796,6 +1004,8 @@ export default function Viewer({
   onResize: (cols: number, rows: number) => void;
   /** Commit a fuse/split made from the 3D selection popup. */
   onGridChange: (next: GridState) => void;
+  /** Rendering options (printed look, layer height). */
+  view: ViewSettings;
   /** Which button→action preset to use; a future settings UI feeds this. */
   viewMappingId?: string;
 }) {
@@ -834,7 +1044,16 @@ export default function Viewer({
         <directionalLight position={[150, 300, 200]} intensity={1.4} />
         <directionalLight position={[-200, 150, -100]} intensity={0.4} />
         <directionalLight position={[50, -200, 80]} intensity={0.5} />
-        {mesh && <TrayMesh mesh={mesh} sel={sel} params={params} pickRef={trayPickRef} />}
+        {mesh && (
+          <TrayMesh
+            mesh={mesh}
+            sel={sel}
+            grid={grid}
+            params={params}
+            view={view}
+            pickRef={trayPickRef}
+          />
+        )}
         <ResizeHandles3D cols={cols} rows={rows} mesh={mesh} onResize={onResize} goalRef={goalRef} />
         <CellSelector
           grid={grid}

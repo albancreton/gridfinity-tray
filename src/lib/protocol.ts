@@ -6,6 +6,7 @@ export const PITCH = 42;
 export const CLEAR = 0.25; // gap to the 42mm grid on each side
 export const BASE_H = 4.75; // gridfinity base foot section
 export const LIP_H = 4.4; // stacking lip added above the nominal height
+export const R_OUT = 3.75; // outer corner radius of the tray outline
 
 /** Inclusive cell-coordinate rectangle: rows r0..r1, cols c0..c1. */
 export interface Region {

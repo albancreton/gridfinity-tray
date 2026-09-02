@@ -32,13 +32,14 @@ react-three-fiber 9 + drei 10 · replicad 1.0 over OpenCASCADE WASM, in a web wo
 
 | File | Role |
 |---|---|
-| `src/app/page.tsx` | State owner: `GridState` + `TrayParams` → `TraySpec`; 150ms-debounced, latest-wins mesh requests; localStorage persistence (`gridfinity-tray-v1`); export handler; size readout |
+| `src/app/page.tsx` | State owner: `GridState` + `TrayParams` → `TraySpec`; 150ms-debounced, latest-wins mesh requests; plus render-only `ViewSettings`; localStorage persistence (`gridfinity-tray-v1`); export handler; size readout |
 | `src/components/GridEditor.tsx` | The 2D grid: drag-select, drag handles to resize, Fuse/Split buttons |
-| `src/components/Sidebar.tsx` | Base UI number fields + switches for params, export buttons |
-| `src/components/Viewer.tsx` | R3F canvas: mesh display (flat-shaded + edge lines), `CameraRig` (eased camera flights via a shared goal ref), `ResizeHandles3D` (3D grid resize: top view + shadow preview, commit on release), `MappedControls` (view controls) |
+| `src/components/Sidebar.tsx` | Base UI number fields + switches for params, printed-look switch + layer height, export buttons |
+| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (flat-shaded + edge lines; selection-tint and printed-look shader patches), `CameraRig` (eased camera flights via a shared goal ref), `ResizeHandles3D` (3D grid resize: top view + shadow preview, commit on release), `MappedControls` (view controls) |
 | `src/lib/grid.ts` | Pure grid model: `merges: Region[]` (only >1-cell merges stored; uncovered cells are implicit 1×1). `expandSelection` grows a rect over touched merges until stable — spreadsheet semantics |
-| `src/lib/protocol.ts` | Shared types (`TraySpec`, `MeshData`, worker messages) + shared mm constants + `traySizeMm()` |
+| `src/lib/protocol.ts` | Shared types (`TraySpec`, `MeshData`, worker messages) + shared mm constants (incl. `R_OUT`, used by both the worker and the printed-look shader) + `traySizeMm()` |
 | `src/lib/viewMapping.ts` | Mouse-button → view-action presets (pure data). Active: `"fusion"` (middle=pan, shift+middle=orbit, wheel=zoom, left/right free) |
+| `src/lib/viewSettings.ts` | Render-only settings (`printLook`, `layerHeight`) + defaults. They never reach the worker — a change must not trigger a rebuild |
 | `src/lib/cadClient.ts` | Worker singleton, promise-per-request, `downloadBlob` |
 | `src/workers/cad.worker.ts` | All geometry. `buildTray(spec)` is pure: feet loft → body extrude → fuse → pocket cuts → lip socket cut → magnet cuts. Mesh + STL + STEP from the same BRep |
 
@@ -110,6 +111,27 @@ cols/rows/magnets), degraded preview during interaction.
   bounds recompute the worker's `topZ`/`floorZ` formulas from `TrayParams` — keep them
   in sync with `cad.worker.ts`. Uniforms live in a ref and are mutated in an effect
   (never recreate the material; the shader patch compiles once).
+- **Printed look (`TrayMesh` shader, `ViewSettings.printLook`):** an analytic FDM
+  height field perturbs the fragment normal — no geometry, no textures (OCC emits two
+  triangles per flat face, so anything per-vertex is useless). World y is print height
+  with the bed at y=0, so layer seams land where a slicer puts them. Walls/chamfers get
+  layer beads along y (period = layer height); up/down-facing faces get top-fill beads
+  (period = `NOZZLE_LINE_W`); blended by |n.y| (`smoothstep(0.7, 0.95)`, so 45° foot
+  chamfers still show stair-steps). Up-facing faces first get `uPerims` **perimeter
+  loops** hugging the edge of their flat region, then the 45° fill: the shader computes
+  an analytic distance field from the compartment layout — `uRegions` is a 12×12 RGBA8
+  texture mapping each cell to its region rect (c0, r0, c1, r1), `pocketRect()` rebuilds
+  the pocket outline from it with the **same insets and corner radius as
+  `cad.worker.ts`** (change one, change both), and `topEdgeDist()` takes the nearest of
+  the 4 cells around the closest grid corner plus the outer outline, so wall tops and
+  junctions get loops along the wall. Feet bottoms just get fill. Anti-moiré is
+  two-stage and both stages are in *periods per pixel* (`fwidth` of the pattern
+  coordinate): the half-disc bead profile morphs into a pure cosine from ~12px/period
+  (its seam harmonics alias long before the period does — this is what caused the
+  "concentric arcs" on walls), then the whole pattern fades out by ~1.7px/period. At
+  1× DPR that means lines vanish at a typical overview; on retina they hold. Seams also
+  darken the diffuse (`uSeamShade`) and each layer gets a tiny hashed brightness
+  offset. All knobs are uniforms in the same ref as the selection uniforms.
 
 ## Gotchas learned the hard way
 
@@ -136,8 +158,11 @@ cols/rows/magnets), degraded preview during interaction.
 - **Dev hooks** (dev builds only): `window.__cad` (requestMesh/requestExport — parse the
   STL blob to verify dimensions), `window.__controls` (OrbitControls instance) and
   `window.__scene` (THREE.Scene — the default camera is *not* parented to it, so
-  traversing from `__controls.object` finds nothing).
+  traversing from `__controls.object` finds nothing) and `window.__printUniforms` (the
+  tray shader's uniform bag — tweak `uRelief`/`uSeamShade`/`uFillAngle` live).
   Synthetic PointerEvents with fake pointerIds make OrbitControls' `releasePointerCapture`
   throw, leaving its internal drag state stuck (wheel stops working) — reload the page
   after event-driven tests; real mice are unaffected.
 - Removing a drei OrbitControls prop doesn't reset it on HMR — full-reload the page.
+  Same for GLSL edits inside `onBeforeCompile`: three keeps the program compiled from
+  the first callback, so the material never picks up the new source without a reload.
