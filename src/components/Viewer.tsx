@@ -20,6 +20,16 @@ import {
   type TraySpec,
 } from "@/lib/protocol";
 import { buildTrayGeometry, meshBounds, meshVolume, type TrayGeometry } from "@/lib/trayMesher";
+import {
+  PART_EXPLODE_MS,
+  PART_LAND_MS,
+  makeTransition,
+  type CellAnim,
+  type HideBox,
+  type PartGroup,
+  type Snapshot,
+  type Transition,
+} from "@/lib/transitions";
 import { requestMesh } from "@/lib/cadClient";
 import {
   type Frame,
@@ -184,10 +194,6 @@ const sameFrame = (a: Frame, b: Frame) =>
  */
 interface ShadowState extends Frame {
   side: Side;
-  /** true while the pointer is down; false = committed, waiting for the rebuilt mesh. */
-  live: boolean;
-  /** Mesh that was current at commit time — the shadow stays until a newer one arrives. */
-  baseMesh: TrayGeometry | null;
 }
 
 /**
@@ -409,16 +415,13 @@ function ResizeHandles3D({
 
   const beginDrag = (side: Side, e: ThreeEvent<PointerEvent>) => {
     if (detachRef.current || e.nativeEvent.button !== 0) return;
-    // A committed resize still waiting for its mesh owns the world frame until
-    // it lands (its camera shift would otherwise fire mid-drag): wait it out.
-    if (visible && !visible.live) return;
     e.stopPropagation();
     const start: Frame = { c0: 0, r0: 0, c1: cols, r1: rows };
     const frame: Frame = { ...start };
     const controls = getState().controls as unknown as OrbitControlsImpl | null;
     // Mappings that put orbit/pan on the left button must not also move the view.
     if (controls) controls.enabled = false;
-    setShadow({ ...start, side, live: true, baseMesh: null });
+    setShadow({ ...start, side });
 
     const raycaster = new THREE.Raycaster();
     const ndc = new THREE.Vector2();
@@ -446,20 +449,18 @@ function ResizeHandles3D({
       else next.r0 = clamp(u, rows - MAX_UNITS, rows - 1);
       if (sameFrame(next, frame)) return;
       Object.assign(frame, next);
-      setShadow({ ...next, side, live: true, baseMesh: null });
+      setShadow({ ...next, side });
     };
 
     const finish = (commit: boolean) => {
       detach();
       if (controls) controls.enabled = true;
+      setShadow(null);
       if (commit && !sameFrame(frame, start)) {
-        // Keep the shadow up while the worker rebuilds; it clears once a mesh
-        // newer than `baseMesh` lands, and the camera shift is applied then.
-        setShadow({ ...frame, side, live: false, baseMesh: geometry });
+        // The parent re-meshes synchronously; the layout effect above applies
+        // the camera shift in the same commit as the new geometry.
         shiftRef.current = { x: -frame.c0 * PITCH, z: -frame.r0 * PITCH };
         onResize(frame);
-      } else {
-        setShadow(null);
       }
     };
 
@@ -749,8 +750,14 @@ function TrayMesh({
   ghost,
   ghostAlpha = 0.25,
   ghostInside = 1,
+  anim = null,
+  hide = null,
   pickRef,
 }: {
+  /** Per-cell print-in / un-print schedule (lib/transitions); also renders both faces while set. */
+  anim?: CellAnim | null;
+  /** World box whose contents above `minY` are hidden — a split's new dividers until their stand-ins land. */
+  hide?: HideBox | null;
   /** Procedural preview geometry, already in the world frame (lib/trayMesher). */
   geometry: TrayGeometry;
   sel: Region | null;
@@ -776,6 +783,13 @@ function TrayMesh({
     uGhostMax: { value: new THREE.Vector2() },
     uGhostAlpha: { value: 0.25 },
     uGhostInside: { value: 1 },
+    /** Inside-alpha applies only above this height (a split hides dividers, not the floor under them). */
+    uGhostMinY: { value: -1e9 },
+    uCellAnimOn: { value: 0 },
+    /** 12×12 per-cell reveal progress in R (0..255); see the cell-anim frame loop. */
+    uCellAnim: { value: makeRegionTexture() },
+    /** Height a fully revealed cell reaches (a hair above the rim). */
+    uAnimTop: { value: 0 },
     uPrint: { value: 0 },
     uLayerH: { value: 0.2 },
     uLineW: { value: NOZZLE_LINE_W },
@@ -792,12 +806,26 @@ function TrayMesh({
     uPerims: { value: 2 },
   });
   useEffect(() => {
-    const tex = uniforms.current.uRegions.value;
-    return () => tex.dispose();
+    const regions = uniforms.current.uRegions.value;
+    const cells = uniforms.current.uCellAnim.value;
+    return () => {
+      regions.dispose();
+      cells.dispose();
+    };
   }, []);
 
   useEffect(() => {
     const u = uniforms.current;
+    if (hide) {
+      u.uGhostOn.value = 1;
+      u.uGhostMin.value.set(hide.min[0], hide.min[1]);
+      u.uGhostMax.value.set(hide.max[0], hide.max[1]);
+      u.uGhostInside.value = 0;
+      u.uGhostAlpha.value = 1;
+      u.uGhostMinY.value = hide.minY;
+      return;
+    }
+    u.uGhostMinY.value = -1e9;
     u.uGhostOn.value = ghost ? 1 : 0;
     u.uGhostAlpha.value = ghostAlpha;
     u.uGhostInside.value = ghostInside;
@@ -807,7 +835,40 @@ function TrayMesh({
     const m = params.wall / 2;
     u.uGhostMin.value.set(ghost.c0 * PITCH - m, ghost.r0 * PITCH - m);
     u.uGhostMax.value.set(ghost.c1 * PITCH + m, ghost.r1 * PITCH + m);
-  }, [ghost, ghostAlpha, ghostInside, params.wall]);
+  }, [ghost, ghostAlpha, ghostInside, hide, params.wall]);
+
+  useEffect(() => {
+    const u = uniforms.current;
+    u.uCellAnimOn.value = anim ? 1 : 0;
+    u.uAnimTop.value = trayTopY(params) + 0.5;
+  }, [anim, params]);
+
+  // Per-cell reveal: rewrite the progress texture every frame while animating.
+  // Runs before the frame renders, so the first animated frame is already right.
+  useFrame(() => {
+    if (!anim) return;
+    const u = uniforms.current;
+    const data = u.uCellAnim.value.image.data as Uint8Array;
+    const now = performance.now();
+    const { cols, rows } = grid;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const delay = anim.delays[r * cols + c];
+        let p: number;
+        if (delay < 0) {
+          p = anim.mode === "in" ? 1 : 0;
+        } else {
+          const t = Math.min(1, Math.max(0, (now - anim.start - delay) / anim.duration));
+          // Smoothstep: the cut keeps moving through the whole duration (an
+          // ease-out front-loads it into a flash, an ease-in hides it until the end).
+          const e = t * t * (3 - 2 * t);
+          p = anim.mode === "in" ? e : 1 - e;
+        }
+        data[(r * MAX_UNITS + c) * 4] = Math.round(p * 255);
+      }
+    }
+    u.uCellAnim.value.needsUpdate = true;
+  });
 
   useEffect(() => {
     const u = uniforms.current;
@@ -882,6 +943,10 @@ uniform vec2 uGhostMin;
 uniform vec2 uGhostMax;
 uniform float uGhostAlpha;
 uniform float uGhostInside;
+uniform float uGhostMinY;
+uniform float uCellAnimOn;
+uniform sampler2D uCellAnim;
+uniform float uAnimTop;
 varying vec3 vWorldNormal;
 uniform vec3 uSelMin;
 uniform vec3 uSelMax;
@@ -971,11 +1036,21 @@ float fdmHash(float x) { return fract(sin(x * 12.9898) * 43758.5453); }`,
         .replace(
           "vec4 diffuseColor = vec4( diffuse, opacity );",
           `vec4 diffuseColor = vec4( diffuse, opacity );
+// The material is always double-sided (switching sides would compile a new
+// program right as an animation starts); a closed tray only wants its inside
+// while a cell is cut open by the reveal.
+if (!gl_FrontFacing && uCellAnimOn < 0.5) discard;
 if (uGhostOn > 0.5) {
   bool outsideGhost = vWorldPos.x < uGhostMin.x || vWorldPos.x > uGhostMax.x ||
     vWorldPos.z < uGhostMin.y || vWorldPos.z > uGhostMax.y;
-  diffuseColor.a *= outsideGhost ? uGhostAlpha : uGhostInside;
+  diffuseColor.a *= outsideGhost ? uGhostAlpha : (vWorldPos.y > uGhostMinY ? uGhostInside : 1.0);
   if (diffuseColor.a < 0.01) discard;
+}
+if (uCellAnimOn > 0.5) {
+  // Per-cell print-in: only the part of a cell below its progress height exists yet.
+  ivec2 animCell = ivec2(clamp(floor(vLocalPos.xz / FDM_PITCH), vec2(0.0), uGrid - 1.0));
+  float animP = texelFetch(uCellAnim, animCell, 0).r;
+  if (animP <= 0.0 || vLocalPos.y >= animP * uAnimTop) discard;
 }
 if (uSelActive > 0.5) {
   vec3 n = normalize(vWorldNormal);
@@ -995,7 +1070,8 @@ if (uSelActive > 0.5) {
           "#include <normal_fragment_maps>",
           `#include <normal_fragment_maps>
 if (uPrint > 0.5) {
-  vec3 nw = normalize(vWorldNormal);
+  // Back faces show inside a cell that is still printing in; flip to shade them.
+  vec3 nw = normalize(vWorldNormal) * (gl_FrontFacing ? 1.0 : -1.0);
   // Layers repeat along world y; top fill repeats along the fill direction in xz.
   float ly = vWorldPos.y / uLayerH;
   // Top pattern: uPerims loops hugging the region's edge, diagonal fill inside.
@@ -1047,23 +1123,34 @@ if (uPrint > 0.5) {
         uGhostMax: u.uGhostMax,
         uGhostAlpha: u.uGhostAlpha,
         uGhostInside: u.uGhostInside,
+        uGhostMinY: u.uGhostMinY,
+        uCellAnimOn: u.uCellAnimOn,
+        uCellAnim: u.uCellAnim,
+        uAnimTop: u.uAnimTop,
+        uGrid: u.uGrid,
       });
       shader.vertexShader = shader.vertexShader
-        .replace("#include <common>", "#include <common>\nvarying vec3 vWorldPos;")
+        .replace("#include <common>", "#include <common>\nvarying vec3 vWorldPos;\nvarying vec3 vLocalPos;")
         .replace(
           "#include <worldpos_vertex>",
-          "#include <worldpos_vertex>\nvWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;",
+          "#include <worldpos_vertex>\nvWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;\nvLocalPos = transformed;",
         );
       shader.fragmentShader = shader.fragmentShader
         .replace(
           "#include <common>",
           `#include <common>
 varying vec3 vWorldPos;
+varying vec3 vLocalPos;
 uniform float uGhostOn;
 uniform vec2 uGhostMin;
 uniform vec2 uGhostMax;
 uniform float uGhostAlpha;
-uniform float uGhostInside;`,
+uniform float uGhostInside;
+uniform float uGhostMinY;
+uniform float uCellAnimOn;
+uniform sampler2D uCellAnim;
+uniform float uAnimTop;
+uniform vec2 uGrid;`,
         )
         .replace(
           "vec4 diffuseColor = vec4( diffuse, opacity );",
@@ -1071,8 +1158,13 @@ uniform float uGhostInside;`,
 if (uGhostOn > 0.5) {
   bool outsideGhost = vWorldPos.x < uGhostMin.x || vWorldPos.x > uGhostMax.x ||
     vWorldPos.z < uGhostMin.y || vWorldPos.z > uGhostMax.y;
-  diffuseColor.a *= outsideGhost ? uGhostAlpha : uGhostInside;
+  diffuseColor.a *= outsideGhost ? uGhostAlpha : (vWorldPos.y > uGhostMinY ? uGhostInside : 1.0);
   if (diffuseColor.a < 0.01) discard;
+}
+if (uCellAnimOn > 0.5) {
+  ivec2 animCell = ivec2(clamp(floor(vLocalPos.xz / ${PITCH}.0), vec2(0.0), uGrid - 1.0));
+  float animP = texelFetch(uCellAnim, animCell, 0).r;
+  if (animP <= 0.0 || vLocalPos.y >= animP * uAnimTop) discard;
 }`,
         );
     },
@@ -1112,6 +1204,9 @@ if (uGhostOn > 0.5) {
           // material stays opaque (depth-sorted, no self-overlap artifacts)
           // and the multisampled canvas resolves 25% coverage to a clean fade.
           alphaToCoverage
+          // Always double-sided so no program compiles when a reveal starts; the
+          // shader discards back faces unless a cell is cut open (see onBeforeCompile).
+          side={THREE.DoubleSide}
           onBeforeCompile={onBeforeCompile}
         />
       </mesh>
@@ -1125,6 +1220,141 @@ if (uGhostOn > 0.5) {
       </lineSegments>
     </>
   );
+}
+
+// Gentle, slow-motion physics to match the 2s burst: pieces lift ~15–30mm and
+// come back down around the midpoint, fading through the second half.
+const PART_GRAVITY = 120; // mm/s²
+const PART_DROP = 40; // mm a landing divider falls from
+
+function easeOutBounce(x: number): number {
+  const n1 = 7.5625, d1 = 2.75;
+  if (x < 1 / d1) return n1 * x * x;
+  if (x < 2 / d1) return n1 * (x -= 1.5 / d1) * x + 0.75;
+  if (x < 2.5 / d1) return n1 * (x -= 2.25 / d1) * x + 0.9375;
+  return n1 * (x -= 2.625 / d1) * x + 0.984375;
+}
+
+/**
+ * Rigid stand-ins for divider walls: the ones a fuse removes burst up and away
+ * (fading out mid-flight), the ones a split adds drop in one after another and
+ * bounce. Boxes from lib/transitions sit exactly where the real walls were/are.
+ */
+function DividerParts({ group, start }: { group: PartGroup; start: number }) {
+  const meshes = useRef<(THREE.Mesh | null)[]>([]);
+  const built = useMemo(() => {
+    const material = new THREE.MeshStandardMaterial({
+      color: "#59B9BA",
+      roughness: 0.55,
+      metalness: 0.05,
+      alphaToCoverage: true,
+    });
+    const lineMaterial = new THREE.LineBasicMaterial({ color: "#0f3536", transparent: true, opacity: 0.4 });
+    const items = group.boxes.map((b, i) => {
+      const geometry = new THREE.BoxGeometry(b.x1 - b.x0, b.y1 - b.y0, b.z1 - b.z0);
+      const edges = new THREE.EdgesGeometry(geometry);
+      const center: [number, number, number] = [(b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2, (b.z0 + b.z1) / 2];
+      // Deterministic per-part randomness: a replay looks the same.
+      const rnd = (k: number) => {
+        const s = Math.sin(i * 12.9898 + k * 78.233) * 43758.5453;
+        return s - Math.floor(s);
+      };
+      let dx = center[0] - group.center[0];
+      let dz = center[2] - group.center[1];
+      const len = Math.hypot(dx, dz) || 1;
+      dx /= len;
+      dz /= len;
+      return {
+        geometry,
+        edges,
+        center,
+        delay: group.mode === "explode" ? (rnd(0) * 0.06 * group.duration) / 1000 : (i * group.stagger) / 1000,
+        vx: dx * (20 + 20 * rnd(1)) + (rnd(2) - 0.5) * 8,
+        vy: 60 + 40 * rnd(3),
+        vz: dz * (20 + 20 * rnd(4)) + (rnd(5) - 0.5) * 8,
+        wx: (rnd(6) - 0.5) * 3,
+        wy: (rnd(7) - 0.5) * 1.5,
+        wz: (rnd(8) - 0.5) * 3,
+      };
+    });
+    return { material, lineMaterial, items };
+  }, [group]);
+  useEffect(
+    () => () => {
+      built.material.dispose();
+      built.lineMaterial.dispose();
+      for (const it of built.items) {
+        it.geometry.dispose();
+        it.edges.dispose();
+      }
+    },
+    [built],
+  );
+
+  useFrame(() => {
+    const t = (performance.now() - start) / 1000;
+    const dur = group.duration / 1000;
+    // The flight is tuned in nominal seconds; a stretched transition (the dev
+    // slow-motion knob) stretches the physics the same way.
+    const timeScale = (group.mode === "explode" ? PART_EXPLODE_MS : PART_LAND_MS) / 1000 / dur;
+    let fade = 1;
+    if (group.mode === "explode") {
+      const k = Math.min(1, Math.max(0, (t / dur - 0.5) / 0.5));
+      fade = 1 - k * k;
+    }
+    built.items.forEach((it, i) => {
+      const m = meshes.current[i];
+      if (!m) return;
+      // The materials are shared; setting them through the mesh keeps the
+      // memoized bag itself untouched after render.
+      (m.material as THREE.MeshStandardMaterial).opacity = fade;
+      const lines = m.children[0] as THREE.LineSegments | undefined;
+      if (lines) (lines.material as THREE.LineBasicMaterial).opacity = 0.4 * fade;
+      const raw = Math.max(0, t - it.delay);
+      const tt = raw * timeScale;
+      if (group.mode === "explode") {
+        m.position.set(
+          it.center[0] + it.vx * tt,
+          it.center[1] + it.vy * tt - 0.5 * PART_GRAVITY * tt * tt,
+          it.center[2] + it.vz * tt,
+        );
+        m.rotation.set(it.wx * tt, it.wy * tt, it.wz * tt);
+      } else {
+        const s = Math.min(1, raw / dur);
+        m.position.set(it.center[0], it.center[1] + PART_DROP * (1 - easeOutBounce(s)), it.center[2]);
+        m.visible = raw > 0;
+      }
+    });
+  });
+
+  return (
+    <group>
+      {built.items.map((it, i) => (
+        <mesh
+          key={i}
+          ref={(el) => {
+            meshes.current[i] = el;
+          }}
+          geometry={it.geometry}
+          material={built.material}
+          position={it.center}
+        >
+          <lineSegments geometry={it.edges} material={built.lineMaterial} />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+/** Calls `onDone` once the transition's end time has passed. */
+function TransitionEnd({ end, onDone }: { end: number; onDone: () => void }) {
+  const done = useRef(false);
+  useFrame(() => {
+    if (done.current || performance.now() < end) return;
+    done.current = true;
+    onDone();
+  });
+  return null;
 }
 
 /**
@@ -1226,20 +1456,41 @@ export default function Viewer({
   const trayPickRef = useRef<THREE.Mesh | null>(null);
   const [selection, setSelection] = useState<Region | null>(null);
   const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
-  // Pending resize footprint. Lives here because both the handles (shadow,
-  // handle placement) and the tray (ghosting outside it) render from it. A
-  // committed shadow outlives its drag until a mesh newer than `baseMesh` lands.
+  // Pending resize footprint. Lives here because both the handles (label,
+  // handle placement) and the tray (ghost, grow preview) render from it.
   const [shadow, setShadow] = useState<ShadowState | null>(null);
-  const shadowVisible = shadow && (shadow.live || shadow.baseMesh === geometry) ? shadow : null;
+
+  // --- Transitions: how the last layout turns into this one ----------------
+  // Derived in render (React's "adjust state from props" pattern) so the
+  // retiring mesh and the new geometry land in the same commit — there is no
+  // frame where removed cells are simply gone. The change that caused it is
+  // marked in state by the event handler (resize frame, or null for fuse/split,
+  // plus the clock — render must stay pure), in the same event as the parent's
+  // grid update, so both batch into one render; the derivation consumes it.
+  // Changes without a mark (Settings params, restores) never animate.
+  const [pending, setPending] = useState<{ frame: Frame | null; at: number } | null>(null);
+  const [prev, setPrev] = useState<Snapshot>(() => ({ grid, geometry, params }));
+  const [anim, setAnim] = useState<Transition | null>(null);
+  if (geometry !== prev.geometry) {
+    const next: Snapshot = { grid, geometry, params };
+    const t = pending ? makeTransition(prev, next, pending.frame, pending.at) : null;
+    setPrev(next);
+    if (pending) setPending(null);
+    if (t) setAnim(t);
+  }
+  useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (process.env.NODE_ENV === "development") (window as any).__transition = anim;
+  }, [anim]);
   // Grow preview: while the pending footprint reaches past the current tray, mesh
   // the future tray (its cell (0,0) lands at the frame's origin) and draw it at
   // half coverage where the current tray isn't — the "add" counterpart of the
   // 25% ghost a shrink puts on the part being removed.
-  const fc0 = shadowVisible?.c0 ?? 0;
-  const fr0 = shadowVisible?.r0 ?? 0;
-  const fc1 = shadowVisible?.c1 ?? cols;
-  const fr1 = shadowVisible?.r1 ?? rows;
-  const grows = shadowVisible !== null && (fc0 < 0 || fr0 < 0 || fc1 > cols || fr1 > rows);
+  const fc0 = shadow?.c0 ?? 0;
+  const fr0 = shadow?.r0 ?? 0;
+  const fc1 = shadow?.c1 ?? cols;
+  const fr1 = shadow?.r1 ?? rows;
+  const grows = shadow !== null && (fc0 < 0 || fr0 < 0 || fc1 > cols || fr1 > rows);
   const preview = useMemo(() => {
     if (!grows) return null;
     const next = reframe(grid, { c0: fc0, r0: fr0, c1: fc1, r1: fr1 });
@@ -1262,6 +1513,9 @@ export default function Viewer({
   // Cell indices shift under a left/top resize, so a selection can't survive one.
   const handleResize = (frame: Frame) => {
     handleSelect(null);
+    // Batched with the parent's grid update: the next render sees both and
+    // derives the transition (see below).
+    setPending({ frame, at: performance.now() });
     onResize(frame);
   };
 
@@ -1298,9 +1552,28 @@ export default function Viewer({
           grid={grid}
           params={params}
           view={view}
-          ghost={shadowVisible}
+          ghost={shadow}
+          anim={anim?.appear ?? null}
+          hide={anim?.hide ?? null}
           pickRef={trayPickRef}
         />
+        {anim?.retire && (
+          <group position={anim.retire.offset}>
+            <TrayMesh
+              geometry={anim.retire.geometry}
+              sel={null}
+              grid={anim.retire.grid}
+              params={params}
+              view={view}
+              ghost={null}
+              anim={anim.retire.anim}
+            />
+          </group>
+        )}
+        {anim?.parts.map((group) => (
+          <DividerParts key={`${anim.start}:${group.mode}`} group={group} start={anim.start} />
+        ))}
+        {anim && <TransitionEnd key={anim.start} end={anim.end} onDone={() => setAnim(null)} />}
         {preview && (
           <group position={preview.offset}>
             <TrayMesh
@@ -1324,7 +1597,7 @@ export default function Viewer({
           geometry={geometry}
           trayRef={trayPickRef}
           topY={trayTopY(params)}
-          shadow={shadowVisible}
+          shadow={shadow}
           setShadow={setShadow}
           onResize={handleResize}
         />
@@ -1359,6 +1632,7 @@ export default function Viewer({
             className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white enabled:hover:bg-sky-500 disabled:opacity-30"
             disabled={!canFuse}
             onClick={() => {
+              setPending({ frame: null, at: performance.now() });
               onGridChange(fuse(grid, sel));
               handleSelect(null);
             }}
@@ -1369,6 +1643,7 @@ export default function Viewer({
             className="rounded-md bg-neutral-700 px-3 py-1.5 text-sm font-medium text-neutral-100 enabled:hover:bg-neutral-600 disabled:opacity-30"
             disabled={!canSplit}
             onClick={() => {
+              setPending({ frame: null, at: performance.now() });
               onGridChange(split(grid, sel));
               handleSelect(null);
             }}

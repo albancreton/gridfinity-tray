@@ -19,8 +19,9 @@ watches a live 3D preview. The whole UI is the 3D view plus two top-left buttons
 (Settings, Export); the former sidebar and 2D grid editor were removed in Sept 2026.
 Everything is client-side; there is no backend. The preview is meshed **procedurally on
 the main thread** (`lib/trayMesher.ts`, ~3ms for a 3×2) from a shared layout module; the
-CAD kernel only builds the exports (since Sept 2026 — before that the preview waited on
-the worker, which is why the viewer still has some latency-masking machinery, see below).
+CAD kernel only builds the exports (since Sept 2026). Layout changes animate: cells
+print in / un-print on resize, divider walls burst away on fuse and drop in on split
+(see "Transitions").
 
 **Stack:** Next.js 16.3 (Turbopack) · TypeScript · Tailwind v4 · Base UI
 (`@base-ui/react` — NOT `@base-ui-components/react`, that package doesn't exist) ·
@@ -39,7 +40,8 @@ react-three-fiber 9 + drei 10 · replicad 1.0 over OpenCASCADE WASM, in a web wo
 |---|---|
 | `src/app/page.tsx` | State owner: `GridState` + `TrayParams` → `TraySpec` → `buildTrayGeometry(spec)` in a `useMemo` (synchronous, no debounce); plus render-only `ViewSettings`; localStorage persistence (`gridfinity-tray-v1`); export handler (the only worker call); size readout |
 | `src/components/Toolbar.tsx` | Floating top-left buttons (Base UI `Popover`): Settings (params, printed look, layer height, dev-only CAD overlay toggle) and Export (STL / STEP) |
-| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (uploads the mesher's flat-shaded triangles + edge lines; selection-tint and printed-look shader patches), `CadOverlay` (dev builds: the worker's B-rep edges in red + `window.__compare()`), `ResizeHandles3D` (four edge handles: ground-shadow preview, commit on release, camera compensation for left/top resizes), `MappedControls` (view controls; sets the one-time initial orbit target) |
+| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (uploads the mesher's flat-shaded triangles + edge lines; selection-tint, ghost/hide, per-cell reveal and printed-look shader patches), `DividerParts` + `TransitionEnd` (animation playback), `CadOverlay` (dev builds: the worker's B-rep edges in red + `window.__compare()`), `ResizeHandles3D` (four edge handles: ghost/preview while dragging, commit on release, camera compensation for left/top resizes), `MappedControls` (view controls; sets the one-time initial orbit target) |
+| `src/lib/transitions.ts` | Pure diff of two layouts into a `Transition`: per-cell reveal schedules for a resize (`CellAnim`), divider-wall boxes a fuse removes / a split adds (`dividerBoxes`, `PartGroup`), the hide box for a split, timing constants |
 | `src/lib/grid.ts` | Pure grid model: `merges: Region[]` (only >1-cell merges stored; uncovered cells are implicit 1×1). `expandSelection` grows a rect over touched merges until stable — spreadsheet semantics. `reframe(state, frame)` re-outlines the grid to a `Frame` (end-exclusive, in the current grid's units, so `c0 < 0` adds columns on the left): merges move with their cells and are clipped at the new bounds |
 | `src/lib/protocol.ts` | Shared types (`TraySpec`, `MeshData`, worker messages) + shared mm constants (incl. `R_OUT`, used by both the worker and the printed-look shader) + `traySizeMm()` |
 | `src/lib/layout.ts` | **Single source of truth for every dimension**: `levels()` (topZ / floorZ / dividerTop), `outerOutline`, `pocketRect` (insets + corner radius), foot loft rings, magnet centers, the lip socket profile. Plan coordinates = the viewer's world xz (x along columns, z along rows, row 0 at z 0..42); heights in mm above the bed. Used by the worker, the mesher and (by hand-copied #defines) the shader |
@@ -121,11 +123,10 @@ floor and the preview just lowers the floor.
   world's units, so `c0 < 0` after a left grow) is drawn only as a size label
   (`SizeLabel`) past its bottom-right corner at the wall top (`trayTopY`) — the
   translucent plane + grid-line overlay it used to have was removed in Sept 2026 once the
-  tray itself showed the footprint (ghost + grow preview below); it persists after commit until a geometry
-  **newer than the commit-time one** renders (`baseMesh` identity compare) — with the
-  synchronous mesher that is the very next render, so the mask is now instantaneous and
-  this machinery is a candidate for removal (live-dragging the real tray instead of a
-  shadow is the planned next step); that same geometry change consumes the pending camera shift. The shadow state lives
+  tray itself showed the footprint (ghost + grow preview below). Release clears it and
+  commits in the same event; the camera shift for a left/top resize is applied by a layout
+  effect keyed on the geometry identity, i.e. in the commit that swaps the geometry (the
+  old "shadow persists until a newer mesh lands" machinery went with the worker). The shadow state lives
   in `Viewer` because the tray renders from it too: `TrayMesh`'s `ghost` prop feeds
   `uGhost*` uniforms and fragments outside the kept box (expanded by wall/2 so the future
   outer wall stays solid) get 25% alpha — via **alpha-to-coverage** on the still-opaque
@@ -188,6 +189,53 @@ floor and the preview just lowers the floor.
   darken the diffuse (`uSeamShade`) and each layer gets a tiny hashed brightness
   offset. All knobs are uniforms in the same ref as the selection uniforms.
 
+## Transitions (Viewer.tsx + `lib/transitions.ts`)
+
+- **Model:** `makeTransition(prev, next, frame, at)` diffs two `Snapshot`s
+  (`{grid, geometry, params}`) into a `Transition`: `appear` (a `CellAnim` for the new
+  tray — per-cell delays, mode "in"), `retire` (the previous geometry placed in the new
+  world at `(-c0, -r0)·PITCH` with a mode "out" `CellAnim`), `parts` (rigid `PartGroup`s
+  of divider boxes: "explode" for a fuse, "land" for a split) and `hide` (world box above
+  the floor where the main mesh hides a split's new dividers until the stand-ins land).
+  A resize needs its `Frame` (old units) to know where the old cells sit in the new world;
+  a same-size change without one is a fuse/split. Timing (deliberately unhurried, by
+  request): 1300ms per cell with a smoothstep ease, ≤180ms stagger (shrinks with the
+  count, 2400ms budget), 2000ms burst (gravity 120mm/s², lift 60–100mm/s), 1000ms drop +
+  120ms stagger. A 320ms ease-out was tried first and read as a flash, 520ms still felt
+  quick: the cut has to keep moving for the whole duration to register as printing. Wave
+  order: growing = nearest-first, shrinking = farthest-first, with a 0.35 ripple along the
+  edge.
+- **Derived in render:** `Viewer` keeps `prev` and `anim` in state and, when the
+  `geometry` prop identity changes, calls `makeTransition` *during render* (React's
+  adjust-state-from-props pattern) so the retiring mesh and the new geometry land in the
+  same commit — no frame where removed cells are simply gone. The event that caused the
+  change marks `pending` state `{frame, at}` (`handleResize`, the Fuse/Split buttons);
+  `at` is taken in the handler because the compiler lint (`react-hooks/purity`) rejects
+  `performance.now()` in render. Unmarked changes (Settings params, restores) never
+  animate. `TransitionEnd` (keyed by `start`) clears `anim` from `useFrame` once `end`
+  passes; a new change mid-flight simply replaces the transition.
+- **Per-cell reveal = shader discard:** `TrayMesh`'s `anim` prop turns on `uCellAnimOn`;
+  its `useFrame` rewrites a 12×12 progress texture (`uCellAnim`, R channel, eased) every
+  frame and the fragment shader discards `vLocalPos.y >= p · uAnimTop` (p = 0 → all), so
+  cells print in from the bed. The material is always DoubleSide and the shader discards
+  back faces unless `uCellAnimOn` is set — so the cut shows the wall's inside instead of a
+  hole, and no program variant compiles (a visible hitch) the moment an animation starts;
+  the print-look normal is flipped for back faces via `gl_FrontFacing`. The edge-line
+  shader carries the same cell discard. Mode "in":
+  unlisted cells p = 1 (shown); "out" (retiring mesh): unlisted cells p = 0 (hidden). The
+  `hide` prop reuses the ghost uniforms with `uGhostMinY` (inside-alpha only above it).
+- **Parts:** `DividerParts` builds one `BoxGeometry` + `EdgesGeometry` per `PartBox`
+  (`dividerBoxes`: one per cell edge between two compartments; ends reach into the outer
+  wall / the junction post and butt flush against a continuing divider, so a run reads as
+  one wall and hides inside solids). Shared material, alpha-to-coverage fade set through
+  the mesh refs (the immutability lint forbids mutating the memoized bag). Explode:
+  deterministic per-part velocity away from the group center + gravity, fading over the
+  second half. Land: 40mm drop with an ease-out bounce, staggered. Physics time is scaled
+  by `nominal/duration` so the slow-motion knob stretches it too.
+- **Dev:** `window.__animSlow = N` stretches every new transition N× (read when it is
+  created); `window.__transition` is the live `Transition` (null when idle). Screenshots
+  through the devtools bridge land ~3s after the request — slow it down to inspect.
+
 ## Gotchas learned the hard way
 
 - **WASM plumbing:** `scripts/copy-wasm.mjs` (predev/prebuild) copies
@@ -225,7 +273,8 @@ floor and the preview just lowers the floor.
 - **Dev hooks** (dev builds only): `window.__cad` (requestMesh/requestExport — parse the
   STL blob to verify dimensions), `window.__buildTray` (the mesher; time it or diff it
   against `__cad.requestMesh` for a spec), `window.__compare()` (bounds + volume of the
-  preview vs the CAD mesh; needs the CAD overlay toggle on), `window.__controls` (OrbitControls instance) and
+  preview vs the CAD mesh; needs the CAD overlay toggle on), `window.__transition` and
+  `window.__animSlow` (see Transitions), `window.__controls` (OrbitControls instance) and
   `window.__scene` (THREE.Scene — the default camera is *not* parented to it, so
   traversing from `__controls.object` finds nothing) and `window.__printUniforms` (the
   tray shader's uniform bag — tweak `uRelief`/`uSeamShade`/`uFillAngle` live).
