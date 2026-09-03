@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame, useLoader, useThree, type ThreeEvent } from "@react-three/fiber";
 import { OrbitControls, Grid, Html, useCursor } from "@react-three/drei";
 import * as THREE from "three";
@@ -19,13 +19,13 @@ import {
   type TrayParams,
 } from "@/lib/protocol";
 import {
+  type Frame,
   type GridState,
   MAX_UNITS,
   allRegions,
   boundingRect,
   canFuseSelection,
   canSplitSelection,
-  clampUnits,
   expandSelection,
   fuse,
   regionAt,
@@ -159,15 +159,22 @@ const HANDLE_REST_Y = 0.25; // just above the ground grid
 const HANDLE_HOVER_Y = 3; // mm the icon lifts while hovered or dragged
 const RESIZE_ICON_URL: string = resizeIcon.src;
 
-type Axis = "x" | "y";
+/** Which tray edge a handle drags. */
+type Side = "left" | "right" | "top" | "bottom";
+const SIDES: readonly Side[] = ["left", "right", "top", "bottom"];
+/** Left/right edges move along x; top/bottom along z. */
+const alongX = (side: Side) => side === "left" || side === "right";
 
-/** Spin about y so the double chevron points along the axis it resizes. */
-const AXIS_SPIN: Record<Axis, number> = { x: Math.PI / 2, y: 0 };
+const sameFrame = (a: Frame, b: Frame) =>
+  a.c0 === b.c0 && a.r0 === b.r0 && a.c1 === b.c1 && a.r1 === b.r1;
 
-interface ShadowState {
-  cols: number;
-  rows: number;
-  axis: Axis;
+/**
+ * A pending footprint in unit coordinates of the world *as displayed*
+ * (end-exclusive; the tray on screen always spans 0..cols × 0..rows). Dragging
+ * the left/top edge makes c0/r0 negative (growing) or positive (shrinking).
+ */
+interface ShadowState extends Frame {
+  side: Side;
   /** true while the pointer is down; false = committed, waiting for the rebuilt mesh. */
   live: boolean;
   /** Mesh that was current at commit time — the shadow stays until a newer one arrives. */
@@ -196,17 +203,16 @@ function useResizeIconGeometry(): THREE.BufferGeometry {
 /**
  * One handle's chevrons. At rest: half size, half opacity, on the ground. Hover:
  * full opacity and a small lift. In use (dragging): full size, and the other
- * handle fades out (`dimmed`). All ease over ~100ms
- * in the frame loop; the initial props are stable primitives so re-renders never
- * snap them.
+ * handles fade out (`dimmed`). All ease over ~100ms in the frame loop; the
+ * initial props are stable primitives so re-renders never snap them.
  */
 function HandleIcon({
-  axis,
+  side,
   hover,
   active,
   dimmed,
 }: {
-  axis: Axis;
+  side: Side;
   hover: boolean;
   active: boolean;
   dimmed: boolean;
@@ -231,7 +237,8 @@ function HandleIcon({
       ref={meshRef}
       geometry={geometry}
       position-y={HANDLE_REST_Y}
-      rotation-y={AXIS_SPIN[axis]}
+      // spin so the double chevron points along the axis this edge moves on
+      rotation-y={alongX(side) ? Math.PI / 2 : 0}
       scale={HANDLE_REST_SCALE}
       raycast={() => null}
       renderOrder={5}
@@ -251,62 +258,84 @@ function HandleIcon({
 function Handle({
   x,
   z,
-  axis,
+  side,
   active,
   dimmed,
+  trayRef,
   onDown,
 }: {
   x: number;
   z: number;
-  axis: Axis;
+  side: Side;
   active: boolean;
-  /** The other handle is in use: fade out and stop taking the pointer. */
+  /** Another handle is in use: fade out and stop taking the pointer. */
   dimmed: boolean;
-  onDown: (axis: Axis, e: ThreeEvent<PointerEvent>) => void;
+  trayRef: React.RefObject<THREE.Mesh | null>;
+  onDown: (side: Side, e: ThreeEvent<PointerEvent>) => void;
 }) {
   const [hover, setHover] = useState(false);
-  const hx = axis === "y" ? HANDLE_HIT_LONG : HANDLE_HIT_SHORT;
-  const hz = axis === "x" ? HANDLE_HIT_LONG : HANDLE_HIT_SHORT;
+  const hx = alongX(side) ? HANDLE_HIT_SHORT : HANDLE_HIT_LONG;
+  const hz = alongX(side) ? HANDLE_HIT_LONG : HANDLE_HIT_SHORT;
+  // The tray mesh has no pointer handlers, so R3F raycasts straight through it
+  // to the hit box: a handle hidden behind the tray would still hover and grab
+  // clicks. Check the event's own ray against the tray and ignore covered hits
+  // (the click then falls through to the cell selector, as the user sees it).
+  const covered = (e: ThreeEvent<PointerEvent>) => {
+    const tray = trayRef.current;
+    if (!tray) return false;
+    const first = new THREE.Raycaster(e.ray.origin, e.ray.direction).intersectObject(tray, false)[0];
+    return first !== undefined && first.distance < e.distance;
+  };
   return (
     <group position={[x, 0, z]}>
       {/* oversized invisible hit box so the flat icon is easy to grab */}
       <mesh
         position-y={HANDLE_HIT_H / 2}
         visible={!dimmed}
-        onPointerDown={(e) => onDown(axis, e)}
+        onPointerDown={(e) => {
+          if (!covered(e)) onDown(side, e);
+        }}
         onPointerOver={(e) => {
+          if (covered(e)) return;
           e.stopPropagation();
           setHover(true);
         }}
+        onPointerMove={(e) => setHover(!covered(e))}
         onPointerOut={() => setHover(false)}
       >
         <boxGeometry args={[hx, HANDLE_HIT_H, hz]} />
         <meshBasicMaterial transparent opacity={0} depthWrite={false} />
       </mesh>
       <Suspense fallback={null}>
-        <HandleIcon axis={axis} hover={hover && !dimmed} active={active} dimmed={dimmed} />
+        <HandleIcon side={side} hover={hover && !dimmed} active={active} dimmed={dimmed} />
       </Suspense>
     </group>
   );
 }
 
 /** Ghost footprint of the pending size: fill + unit gridlines + size badge. */
-function SizeShadow({ cols, rows }: { cols: number; rows: number }) {
-  const w = cols * PITCH;
-  const d = rows * PITCH;
+function SizeShadow({ c0, r0, c1, r1 }: Frame) {
+  const x0 = c0 * PITCH;
+  const x1 = c1 * PITCH;
+  const z0 = r0 * PITCH;
+  const z1 = r1 * PITCH;
   const lines = useMemo(() => {
     const pts: number[] = [];
-    for (let i = 0; i <= cols; i++) pts.push(i * PITCH, 0, 0, i * PITCH, 0, d);
-    for (let j = 0; j <= rows; j++) pts.push(0, 0, j * PITCH, w, 0, j * PITCH);
+    for (let c = c0; c <= c1; c++) pts.push(c * PITCH, 0, z0, c * PITCH, 0, z1);
+    for (let r = r0; r <= r1; r++) pts.push(x0, 0, r * PITCH, x1, 0, r * PITCH);
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pts), 3));
     return g;
-  }, [cols, rows, w, d]);
+  }, [c0, r0, c1, r1, x0, x1, z0, z1]);
   useEffect(() => () => lines.dispose(), [lines]);
   return (
     <group position={[0, 0.6, 0]}>
-      <mesh position={[w / 2, 0, d / 2]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={10}>
-        <planeGeometry args={[w, d]} />
+      <mesh
+        position={[(x0 + x1) / 2, 0, (z0 + z1) / 2]}
+        rotation={[-Math.PI / 2, 0, 0]}
+        renderOrder={10}
+      >
+        <planeGeometry args={[x1 - x0, z1 - z0]} />
         <meshBasicMaterial
           color="#38bdf8"
           transparent
@@ -318,9 +347,9 @@ function SizeShadow({ cols, rows }: { cols: number; rows: number }) {
       <lineSegments geometry={lines} renderOrder={11}>
         <lineBasicMaterial color="#7dd3fc" transparent opacity={0.8} depthTest={false} />
       </lineSegments>
-      <Html position={[w + 14, 0, d + 14]} center style={{ pointerEvents: "none" }}>
+      <Html position={[x1 + 14, 0, z1 + 14]} center style={{ pointerEvents: "none" }}>
         <div className="rounded-md bg-sky-500 px-2 py-0.5 text-xs font-semibold whitespace-nowrap text-white tabular-nums">
-          {cols} × {rows}
+          {c1 - c0} × {r1 - r0}
         </div>
       </Html>
     </group>
@@ -328,20 +357,28 @@ function SizeShadow({ cols, rows }: { cols: number; rows: number }) {
 }
 
 /**
- * The two grid-resize handles (columns on the right edge, rows on the bottom). Dragging one previews
- * the new size as a ground shadow from whatever view the user is in — the
- * camera never moves — and releasing commits it in one rebuild.
+ * Four grid-resize handles, one per tray edge. Dragging one previews the new
+ * footprint as a ground shadow from whatever view the user is in; releasing
+ * commits it in one rebuild. The tray on screen always has its cell (0,0) at
+ * the world origin (the worker re-anchors there), so after a left/top resize
+ * the surviving cells move in world space when the new mesh lands — the camera
+ * is translated by the same amount in that same commit, so nothing shifts on
+ * screen (the ground grid is 42mm-periodic, so it doesn't give it away either).
  */
 function ResizeHandles3D({
   cols,
   rows,
   mesh,
+  trayRef,
   onResize,
 }: {
   cols: number;
   rows: number;
   mesh: MeshData | null;
-  onResize: (cols: number, rows: number) => void;
+  /** The visible tray mesh, so handles it covers ignore the pointer. */
+  trayRef: React.RefObject<THREE.Mesh | null>;
+  /** Commit a new footprint, in the current grid's unit coordinates. */
+  onResize: (frame: Frame) => void;
 }) {
   const camera = useThree((s) => s.camera) as THREE.PerspectiveCamera;
   const gl = useThree((s) => s.gl);
@@ -350,24 +387,48 @@ function ResizeHandles3D({
   const getState = useThree((s) => s.get);
   const [shadow, setShadow] = useState<ShadowState | null>(null);
   const detachRef = useRef<(() => void) | null>(null);
+  // Camera translation (mm) owed once the rebuilt mesh lands: how far the
+  // surviving cells move when the new origin takes over.
+  const shiftRef = useRef({ x: 0, z: 0 });
 
   useEffect(() => () => detachRef.current?.(), []);
 
-  const beginDrag = (axis: Axis, e: ThreeEvent<PointerEvent>) => {
+  // Layout effect: same commit as the geometry swap, before the next frame.
+  useLayoutEffect(() => {
+    const s = shiftRef.current;
+    if (s.x === 0 && s.z === 0) return;
+    const { camera: cam, controls } = getState();
+    cam.position.x += s.x;
+    cam.position.z += s.z;
+    const c = controls as unknown as OrbitControlsImpl | null;
+    if (c) {
+      c.target.x += s.x;
+      c.target.z += s.z;
+    }
+    s.x = 0;
+    s.z = 0;
+  }, [mesh, getState]);
+
+  const visible = shadow && (shadow.live || shadow.baseMesh === mesh) ? shadow : null;
+
+  const beginDrag = (side: Side, e: ThreeEvent<PointerEvent>) => {
     if (detachRef.current || e.nativeEvent.button !== 0) return;
+    // A committed resize still waiting for its mesh owns the world frame until
+    // it lands (its camera shift would otherwise fire mid-drag): wait it out.
+    if (visible && !visible.live) return;
     e.stopPropagation();
-    const startCols = cols;
-    const startRows = rows;
-    const preview = { cols, rows };
+    const start: Frame = { c0: 0, r0: 0, c1: cols, r1: rows };
+    const frame: Frame = { ...start };
     const controls = getState().controls as unknown as OrbitControlsImpl | null;
     // Mappings that put orbit/pan on the left button must not also move the view.
     if (controls) controls.enabled = false;
-    setShadow({ cols, rows, axis, live: true, baseMesh: null });
+    setShadow({ ...start, side, live: true, baseMesh: null });
 
     const raycaster = new THREE.Raycaster();
     const ndc = new THREE.Vector2();
     const hit = new THREE.Vector3();
     const dom = gl.domElement;
+    const { clamp } = THREE.MathUtils;
 
     const move = (ev: PointerEvent) => {
       if (ev.pointerId !== e.pointerId) return;
@@ -379,27 +440,28 @@ function ResizeHandles3D({
       raycaster.setFromCamera(ndc, camera);
       if (!groundPoint(raycaster.ray, hit)) return;
       // Absolute mapping: the dragged edge snaps to the grid line nearest the
-      // pointer's point on the ground plane, whatever the viewing angle.
-      const c = axis === "x" ? clampUnits(Math.round(hit.x / PITCH)) : startCols;
-      const r = axis === "y" ? clampUnits(Math.round(hit.z / PITCH)) : startRows;
-      preview.cols = c;
-      preview.rows = r;
-      setShadow((s) =>
-        s && s.live && s.cols === c && s.rows === r
-          ? s
-          : { cols: c, rows: r, axis, live: true, baseMesh: null },
-      );
+      // pointer's point on the ground plane, whatever the viewing angle. The
+      // opposite edge stays put and the size is kept within 1..MAX_UNITS.
+      const u = Math.round((alongX(side) ? hit.x : hit.z) / PITCH);
+      const next: Frame = { ...start };
+      if (side === "right") next.c1 = clamp(u, 1, MAX_UNITS);
+      else if (side === "left") next.c0 = clamp(u, cols - MAX_UNITS, cols - 1);
+      else if (side === "bottom") next.r1 = clamp(u, 1, MAX_UNITS);
+      else next.r0 = clamp(u, rows - MAX_UNITS, rows - 1);
+      if (sameFrame(next, frame)) return;
+      Object.assign(frame, next);
+      setShadow({ ...next, side, live: true, baseMesh: null });
     };
 
     const finish = (commit: boolean) => {
       detach();
       if (controls) controls.enabled = true;
-      const changed = commit && (preview.cols !== startCols || preview.rows !== startRows);
-      if (changed) {
-        // Keep the shadow up while the worker rebuilds; it clears once a
-        // mesh newer than `baseMesh` lands.
-        setShadow({ cols: preview.cols, rows: preview.rows, axis, live: false, baseMesh: mesh });
-        onResize(preview.cols, preview.rows);
+      if (commit && !sameFrame(frame, start)) {
+        // Keep the shadow up while the worker rebuilds; it clears once a mesh
+        // newer than `baseMesh` lands, and the camera shift is applied then.
+        setShadow({ ...frame, side, live: false, baseMesh: mesh });
+        shiftRef.current = { x: -frame.c0 * PITCH, z: -frame.r0 * PITCH };
+        onResize(frame);
       } else {
         setShadow(null);
       }
@@ -425,29 +487,35 @@ function ResizeHandles3D({
     window.addEventListener("keydown", key);
   };
 
-  const visible = shadow && (shadow.live || shadow.baseMesh === mesh) ? shadow : null;
-  const pw = (visible?.cols ?? cols) * PITCH;
-  const pd = (visible?.rows ?? rows) * PITCH;
+  // Handles follow the shadow (still in the displayed world's frame after a
+  // commit, until the new mesh lands) or hug the tray.
+  const f: Frame = visible ?? { c0: 0, r0: 0, c1: cols, r1: rows };
+  const x0 = f.c0 * PITCH;
+  const x1 = f.c1 * PITCH;
+  const z0 = f.r0 * PITCH;
+  const z1 = f.r1 * PITCH;
+  const at: Record<Side, [number, number]> = {
+    left: [x0 - HANDLE_GAP, (z0 + z1) / 2],
+    right: [x1 + HANDLE_GAP, (z0 + z1) / 2],
+    top: [(x0 + x1) / 2, z0 - HANDLE_GAP],
+    bottom: [(x0 + x1) / 2, z1 + HANDLE_GAP],
+  };
 
   return (
     <group>
-      {visible && <SizeShadow cols={visible.cols} rows={visible.rows} />}
-      <Handle
-        x={pw + HANDLE_GAP}
-        z={pd / 2}
-        axis="x"
-        active={visible?.axis === "x"}
-        dimmed={visible !== null && visible.axis !== "x"}
-        onDown={beginDrag}
-      />
-      <Handle
-        x={pw / 2}
-        z={pd + HANDLE_GAP}
-        axis="y"
-        active={visible?.axis === "y"}
-        dimmed={visible !== null && visible.axis !== "y"}
-        onDown={beginDrag}
-      />
+      {visible && <SizeShadow c0={visible.c0} r0={visible.r0} c1={visible.c1} r1={visible.r1} />}
+      {SIDES.map((side) => (
+        <Handle
+          key={side}
+          x={at[side][0]}
+          z={at[side][1]}
+          side={side}
+          active={visible?.side === side}
+          dimmed={visible !== null && visible.side !== side}
+          trayRef={trayRef}
+          onDown={beginDrag}
+        />
+      ))}
     </group>
   );
 }
@@ -982,8 +1050,8 @@ export default function Viewer({
   grid: GridState;
   /** Needed to locate the compartment interiors for the selection tint. */
   params: TrayParams;
-  /** Commit a grid resize dragged from the 3D handles. */
-  onResize: (cols: number, rows: number) => void;
+  /** Commit a grid resize dragged from the 3D handles (new outline in current grid units). */
+  onResize: (frame: Frame) => void;
   /** Commit a fuse/split made from the 3D selection popup. */
   onGridChange: (next: GridState) => void;
   /** Rendering options (printed look, layer height). */
@@ -1004,6 +1072,11 @@ export default function Viewer({
     setPopupPos(null);
   }, []);
   const handleRelease = useCallback((x: number, y: number) => setPopupPos({ x, y }), []);
+  // Cell indices shift under a left/top resize, so a selection can't survive one.
+  const handleResize = (frame: Frame) => {
+    handleSelect(null);
+    onResize(frame);
+  };
 
   const canFuse = sel !== null && canFuseSelection(grid, sel);
   const canSplit = sel !== null && canSplitSelection(grid, sel);
@@ -1042,7 +1115,13 @@ export default function Viewer({
             pickRef={trayPickRef}
           />
         )}
-        <ResizeHandles3D cols={cols} rows={rows} mesh={mesh} onResize={onResize} />
+        <ResizeHandles3D
+          cols={cols}
+          rows={rows}
+          mesh={mesh}
+          trayRef={trayPickRef}
+          onResize={handleResize}
+        />
         <CellSelector
           grid={grid}
           selection={sel}

@@ -36,8 +36,8 @@ react-three-fiber 9 + drei 10 · replicad 1.0 over OpenCASCADE WASM, in a web wo
 |---|---|
 | `src/app/page.tsx` | State owner: `GridState` + `TrayParams` → `TraySpec`; 150ms-debounced, latest-wins mesh requests; plus render-only `ViewSettings`; localStorage persistence (`gridfinity-tray-v1`); export handler; size readout |
 | `src/components/Toolbar.tsx` | Floating top-left buttons (Base UI `Popover`): Settings (params, printed look, layer height) and Export (STL / STEP) |
-| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (flat-shaded + edge lines; selection-tint and printed-look shader patches), `ResizeHandles3D` (3D grid resize in place: ground-shadow preview, commit on release), `MappedControls` (view controls; sets the one-time initial orbit target) |
-| `src/lib/grid.ts` | Pure grid model: `merges: Region[]` (only >1-cell merges stored; uncovered cells are implicit 1×1). `expandSelection` grows a rect over touched merges until stable — spreadsheet semantics |
+| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (flat-shaded + edge lines; selection-tint and printed-look shader patches), `ResizeHandles3D` (four edge handles: ground-shadow preview, commit on release, camera compensation for left/top resizes), `MappedControls` (view controls; sets the one-time initial orbit target) |
+| `src/lib/grid.ts` | Pure grid model: `merges: Region[]` (only >1-cell merges stored; uncovered cells are implicit 1×1). `expandSelection` grows a rect over touched merges until stable — spreadsheet semantics. `reframe(state, frame)` re-outlines the grid to a `Frame` (end-exclusive, in the current grid's units, so `c0 < 0` adds columns on the left): merges move with their cells and are clipped at the new bounds |
 | `src/lib/protocol.ts` | Shared types (`TraySpec`, `MeshData`, worker messages) + shared mm constants (incl. `R_OUT`, used by both the worker and the printed-look shader) + `traySizeMm()` |
 | `src/lib/viewMapping.ts` | Mouse-button → view-action presets (pure data). Active: `"fusion"` (middle=pan, shift+middle=orbit, wheel=zoom, left/right free) |
 | `src/lib/viewSettings.ts` | Render-only settings (`printLook`, `layerHeight`) + defaults. They never reach the worker — a change must not trigger a rebuild |
@@ -67,9 +67,14 @@ cols/rows/magnets), degraded preview during interaction.
 ## 3D view conventions (Viewer.tsx)
 
 - **Corner-anchored world:** the tray's top-left cell corner is pinned to the origin;
-  columns grow +x, rows grow +z (row 0 at z 0..42, screen-down in the top view). Resizing
-  therefore never shifts existing geometry, and cell boundaries align with the ground
-  grid's 42mm sections. `TrayMesh` derives its y-offset from the **mesh's own bounds**
+  columns grow +x, rows grow +z (row 0 at z 0..42, screen-down when seen from above).
+  Cell boundaries therefore align with the ground grid's 42mm sections, and resizing
+  from the right/bottom never moves existing geometry. Resizing from the **left/top**
+  does: the worker re-anchors the new cell (0,0) at the origin, so the surviving cells
+  move in world space by whole pitches when the rebuilt mesh lands — `ResizeHandles3D`
+  translates the camera (position + target) by the same amount in a **layout effect
+  keyed on the mesh identity**, i.e. in the same commit as the geometry swap, so nothing
+  moves on screen (and the 42mm-periodic ground grid can't give it away). `TrayMesh` derives its y-offset from the **mesh's own bounds**
   (not the grid props) so the stale mesh stays put while the worker rebuilds — don't
   "simplify" it to `rows * PITCH`. (The worker keeps row 0 at its *top* y; the −90° X
   rotation plus that offset produces the layout above.)
@@ -80,21 +85,30 @@ cols/rows/magnets), degraded preview during interaction.
   the Viewer only once `hydrated`, so that one-time pose frames the *restored* design.
   If a fit-view button is ever wanted, the eased orbit-angle-space flight rig
   (`CameraRig`) is in git history just before that change.
-- **Handle icons:** the two resize handles (columns / rows) are `assets/resize.svg` (a vertical double
+- **Handle icons:** the four resize handles (one per tray edge) are `assets/resize.svg` (a vertical double
   chevron) drawn flat on the ground: Next's static import gives the URL, `SVGLoader`
   turns it into one merged `ShapeGeometry` (`useResizeIconGeometry`), rotated so
   SVG-down maps to +z (screen-down when seen from above) and spun per axis (`AXIS_SPIN`).
-  The icon is not pickable; an oversized invisible box above it takes the pointer. States:
+  The icon is not pickable; an oversized invisible box above it takes the pointer. Handles
+  behind the tray are hidden by it (normal depth test) and must not react either: the tray
+  mesh has no pointer handlers, so R3F raycasts through it — each hit box re-raycasts the
+  event's ray against `trayRef` and ignores covered hits (the click then falls through to
+  the cell selector). States:
   rest = half size + half opacity on the ground, hover = full opacity + 3mm lift,
-  dragging = full size while the other fades out (and stops taking the pointer); all ease
+  dragging = full size while the others fade out (and stop taking the pointer); all ease
   in `useFrame` (the initial scale/opacity props are stable primitives, so re-renders
   don't snap them). No cursor change on hover — by request.
 - **Handle drag flow:** pointerdown disables controls (a mapping with orbit/pan on the
   left button must not also move the view); moves use window-level listeners and
   **absolute** snapping — the pointer is raycast onto the ground plane and the dragged
-  edge goes to the grid line nearest that point, from any viewing angle; release
-  commits once (Escape cancels). The shadow persists after commit until a mesh **newer than the
-  commit-time one** arrives (`baseMesh` identity compare), masking the rebuild.
+  edge goes to the grid line nearest that point, from any viewing angle, while the
+  opposite edge stays put (size clamped to 1..12); release commits once via
+  `onResize(frame)` (Escape cancels) and clears the cell selection, whose indices would
+  shift under a left/top resize. The shadow (`ShadowState`, a `Frame` in the *displayed*
+  world's units, so `c0 < 0` after a left grow) persists after commit until a mesh
+  **newer than the commit-time one** arrives (`baseMesh` identity compare), masking the
+  rebuild; that same mesh change consumes the pending camera shift. While a committed
+  shadow is waiting, the handles are inert — a new drag would straddle the frame change.
 - **Stable camera props:** the `Canvas` `camera` object lives in a `useState`
   initializer and OrbitControls gets its target imperatively (not as a prop) — a
   fresh object/array identity on re-render re-applies the prop and teleports the

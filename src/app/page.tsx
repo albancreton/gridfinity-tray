@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import Toolbar from "@/components/Toolbar";
-import { GridState, allRegions, initialGrid, resize } from "@/lib/grid";
+import { GridState, allRegions, initialGrid, reframe } from "@/lib/grid";
 import { requestExport, requestMesh, downloadBlob } from "@/lib/cadClient";
 import { traySizeMm, type MeshData, type TrayParams, type TraySpec } from "@/lib/protocol";
 import { DEFAULT_VIEW, type ViewSettings } from "@/lib/viewSettings";
@@ -135,7 +135,7 @@ export default function Home() {
             mesh={mesh}
             grid={grid}
             params={params}
-            onResize={(c, r) => setGrid((g) => resize(g, c, r))}
+            onResize={(frame) => setGrid((g) => reframe(g, frame))}
             onGridChange={setGrid}
             view={view}
           />
