@@ -17,7 +17,10 @@ them into larger compartments
 (spreadsheet-style cell merging), tweaks parameters in a floating Settings popover, and
 watches a live 3D preview. The whole UI is the 3D view plus two top-left buttons
 (Settings, Export); the former sidebar and 2D grid editor were removed in Sept 2026.
-Everything is client-side; there is no backend.
+Everything is client-side; there is no backend. The preview is meshed **procedurally on
+the main thread** (`lib/trayMesher.ts`, ~3ms for a 3×2) from a shared layout module; the
+CAD kernel only builds the exports (since Sept 2026 — before that the preview waited on
+the worker, which is why the viewer still has some latency-masking machinery, see below).
 
 **Stack:** Next.js 16.3 (Turbopack) · TypeScript · Tailwind v4 · Base UI
 (`@base-ui/react` — NOT `@base-ui-components/react`, that package doesn't exist) ·
@@ -34,24 +37,34 @@ react-three-fiber 9 + drei 10 · replicad 1.0 over OpenCASCADE WASM, in a web wo
 
 | File | Role |
 |---|---|
-| `src/app/page.tsx` | State owner: `GridState` + `TrayParams` → `TraySpec`; 150ms-debounced, latest-wins mesh requests; plus render-only `ViewSettings`; localStorage persistence (`gridfinity-tray-v1`); export handler; size readout |
-| `src/components/Toolbar.tsx` | Floating top-left buttons (Base UI `Popover`): Settings (params, printed look, layer height) and Export (STL / STEP) |
-| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (flat-shaded + edge lines; selection-tint and printed-look shader patches), `ResizeHandles3D` (four edge handles: ground-shadow preview, commit on release, camera compensation for left/top resizes), `MappedControls` (view controls; sets the one-time initial orbit target) |
+| `src/app/page.tsx` | State owner: `GridState` + `TrayParams` → `TraySpec` → `buildTrayGeometry(spec)` in a `useMemo` (synchronous, no debounce); plus render-only `ViewSettings`; localStorage persistence (`gridfinity-tray-v1`); export handler (the only worker call); size readout |
+| `src/components/Toolbar.tsx` | Floating top-left buttons (Base UI `Popover`): Settings (params, printed look, layer height, dev-only CAD overlay toggle) and Export (STL / STEP) |
+| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (uploads the mesher's flat-shaded triangles + edge lines; selection-tint and printed-look shader patches), `CadOverlay` (dev builds: the worker's B-rep edges in red + `window.__compare()`), `ResizeHandles3D` (four edge handles: ground-shadow preview, commit on release, camera compensation for left/top resizes), `MappedControls` (view controls; sets the one-time initial orbit target) |
 | `src/lib/grid.ts` | Pure grid model: `merges: Region[]` (only >1-cell merges stored; uncovered cells are implicit 1×1). `expandSelection` grows a rect over touched merges until stable — spreadsheet semantics. `reframe(state, frame)` re-outlines the grid to a `Frame` (end-exclusive, in the current grid's units, so `c0 < 0` adds columns on the left): merges move with their cells and are clipped at the new bounds |
 | `src/lib/protocol.ts` | Shared types (`TraySpec`, `MeshData`, worker messages) + shared mm constants (incl. `R_OUT`, used by both the worker and the printed-look shader) + `traySizeMm()` |
+| `src/lib/layout.ts` | **Single source of truth for every dimension**: `levels()` (topZ / floorZ / dividerTop), `outerOutline`, `pocketRect` (insets + corner radius), foot loft rings, magnet centers, the lip socket profile. Plan coordinates = the viewer's world xz (x along columns, z along rows, row 0 at z 0..42); heights in mm above the bed. Used by the worker, the mesher and (by hand-copied #defines) the shader |
+| `src/lib/trayMesher.ts` | Procedural preview mesher: emits the tray's *exterior faces* directly — no solid booleans. Wall top = a height field of the inset from the outer outline (`topBands`: rim / chamfer / step / chamfer / socket floor, plus `wall` as a boundary), built as ring-quads and one flat center polygon, 2D-clipped against the pocket outlines with `polygon-clipping`; walls hang off the clipped polygons' edges (classified as pocket / outer / iso-ring); pocket floors, feet lofts, magnet pockets and the underside gaps are analytic. Also emits the B-rep-style edge lines and flat normals. Dev hook `window.__buildTray` |
 | `src/lib/viewMapping.ts` | Mouse-button → view-action presets (pure data). Active: `"fusion"` (middle=pan, shift+middle=orbit, wheel=zoom, left/right free) |
 | `src/lib/viewSettings.ts` | Render-only settings (`printLook`, `layerHeight`) + defaults. They never reach the worker — a change must not trigger a rebuild |
 | `src/lib/cadClient.ts` | Worker singleton, promise-per-request, `downloadBlob` |
-| `src/workers/cad.worker.ts` | All geometry. `buildTray(spec)` is pure: feet loft → body extrude → fuse → pocket cuts → lip socket cut → magnet cuts. Mesh + STL + STEP from the same BRep |
+| `src/workers/cad.worker.ts` | **Export geometry** (and the dev overlay's mesh). `buildTray(spec)` is pure, all numbers from `layout.ts`: feet loft → body extrude → fuse → pocket cuts → lip socket cut → magnet cuts. STL + STEP from the same BRep. Loads its WASM lazily, on the first export |
 
-The worker holds **no state** between requests — every parameter change rebuilds the whole
-tray (~190ms at 1×1, ~570ms at 3×2 with magnets+lip; boolean ops dominate, meshing doesn't).
-The 150ms debounce in `page.tsx` exists to coalesce bursts (steppers, drag-resize) because
-the worker is serial and stale builds waste its time. Known optimization paths if perf
-becomes a problem: leading-edge debounce, sub-shape caching (feet only depend on
-cols/rows/magnets), degraded preview during interaction.
+**Preview cost** (main thread, per change): ~3ms at 3×2, ~9ms at 6×4, ~16ms at 12×12 without
+lip, ~50ms at 12×12 with lip + magnets (magnets add ~60k triangles; the lip's flat center
+polygon with 100+ holes is the other big item — earcut and one `polygon-clipping`
+difference with the boundary pockets). Next optimization if 12×12 must be drag-smooth:
+build the flat divider network per cell instead of one polygon with holes. The worker
+holds **no state** between requests; an export rebuilds the whole tray (~190ms at 1×1,
+~570ms at 3×2 with magnets+lip; boolean ops dominate).
 
-## Gridfinity numbers (mm) — in `protocol.ts` / `cad.worker.ts`
+**Mesher ↔ CAD agreement** is checked, not assumed: the Settings popover has a dev-only
+"CAD overlay" toggle drawing the worker's edges in red over the preview, and
+`window.__compare()` returns bounds + signed volume of both (they match to ~0.03%;
+the residue is arc sampling). The one deliberate deviation: when the floor is thicker than
+the height allows (pocket floor above the lip's socket floor), the CAD makes a stepped
+floor and the preview just lowers the floor.
+
+## Gridfinity numbers (mm) — in `protocol.ts` / `layout.ts`
 
 - Pitch **42**, clearance **0.25**/side → a tray is `42·n − 0.5` wide.
 - Foot profile bottom→top: 0.8 chamfer / 1.8 straight / 2.15 chamfer = **4.75** base
@@ -70,14 +83,14 @@ cols/rows/magnets), degraded preview during interaction.
   columns grow +x, rows grow +z (row 0 at z 0..42, screen-down when seen from above).
   Cell boundaries therefore align with the ground grid's 42mm sections, and resizing
   from the right/bottom never moves existing geometry. Resizing from the **left/top**
-  does: the worker re-anchors the new cell (0,0) at the origin, so the surviving cells
-  move in world space by whole pitches when the rebuilt mesh lands — `ResizeHandles3D`
+  does: the layout re-anchors the new cell (0,0) at the origin, so the surviving cells
+  move in world space by whole pitches when the new geometry renders — `ResizeHandles3D`
   translates the camera (position + target) by the same amount in a **layout effect
-  keyed on the mesh identity**, i.e. in the same commit as the geometry swap, so nothing
-  moves on screen (and the 42mm-periodic ground grid can't give it away). `TrayMesh` derives its y-offset from the **mesh's own bounds**
-  (not the grid props) so the stale mesh stays put while the worker rebuilds — don't
-  "simplify" it to `rows * PITCH`. (The worker keeps row 0 at its *top* y; the −90° X
-  rotation plus that offset produces the layout above.)
+  keyed on the geometry identity**, i.e. in the same commit as the geometry swap, so
+  nothing moves on screen (and the 42mm-periodic ground grid can't give it away). The
+  mesher emits world-frame geometry directly (x cols, y up, z rows), so `TrayMesh` has no
+  rotation or offset group; only the dev `CadOverlay` still applies the worker's frame
+  (−90° about x after shifting the mesh's own top y to the origin).
 - **The camera belongs to the user:** it starts on `perspectivePose(cols, rows)` (a
   three-quarter view) and is never moved programmatically after that — resizing happens
   in place from whatever view the user is in; no refit, no flight (the earlier fly-to-top
@@ -105,15 +118,27 @@ cols/rows/magnets), degraded preview during interaction.
   opposite edge stays put (size clamped to 1..12); release commits once via
   `onResize(frame)` (Escape cancels) and clears the cell selection, whose indices would
   shift under a left/top resize. The shadow (`ShadowState`, a `Frame` in the *displayed*
-  world's units, so `c0 < 0` after a left grow) floats at the wall top (`trayTopY`) and persists after commit until a mesh
-  **newer than the commit-time one** arrives (`baseMesh` identity compare), masking the
-  rebuild; that same mesh change consumes the pending camera shift. The shadow state lives
+  world's units, so `c0 < 0` after a left grow) is drawn only as a size label
+  (`SizeLabel`) past its bottom-right corner at the wall top (`trayTopY`) — the
+  translucent plane + grid-line overlay it used to have was removed in Sept 2026 once the
+  tray itself showed the footprint (ghost + grow preview below); it persists after commit until a geometry
+  **newer than the commit-time one** renders (`baseMesh` identity compare) — with the
+  synchronous mesher that is the very next render, so the mask is now instantaneous and
+  this machinery is a candidate for removal (live-dragging the real tray instead of a
+  shadow is the planned next step); that same geometry change consumes the pending camera shift. The shadow state lives
   in `Viewer` because the tray renders from it too: `TrayMesh`'s `ghost` prop feeds
   `uGhost*` uniforms and fragments outside the kept box (expanded by wall/2 so the future
   outer wall stays solid) get 25% alpha — via **alpha-to-coverage** on the still-opaque
   material, which the multisampled canvas resolves to a clean fade with no self-overlap
   sorting artifacts; the edge lines get the same factor through their own
-  `onBeforeCompile` sharing the uniform objects. While a committed
+  `onBeforeCompile` sharing the uniform objects. **Grow preview:** when the frame reaches
+  past the current footprint, `Viewer` meshes the *future* tray (`reframe` + the mesher,
+  memoized on the frame) and renders a second `TrayMesh` translated by `(c0, r0)·PITCH`
+  with the ghost box = the current footprint, `ghostInside={0}` (hidden where the current
+  tray stands; alpha < 0.01 discards) and `ghostAlpha={0.5}` — so a shrink shows the
+  removed part at 25% and a grow shows the added part at 50%. The print pattern reads
+  `vLocalPos` (object space) rather than world xz so the translated preview keeps its
+  layout aligned; the selection and ghost boxes stay in world space. While a committed
   shadow is waiting, the handles are inert — a new drag would straddle the frame change.
 - **Stable camera props:** the `Canvas` `camera` object lives in a `useState`
   initializer and OrbitControls gets its target imperatively (not as a prop) — a
@@ -138,8 +163,8 @@ cols/rows/magnets), degraded preview during interaction.
   horizontal top-rim faces (`n.y > 0.9` above `topZ − 0.8`) and outer-shell fragments
   (outward normal within 4.3mm of a box side, covering corner radius 3.75 + clearance).
   The box floor sits just under the pocket floor so feet keep the base color. Its vertical
-  bounds recompute the worker's `topZ`/`floorZ` formulas from `TrayParams` — keep them
-  in sync with `cad.worker.ts`. Uniforms live in a ref and are mutated in an effect
+  bounds recompute the `topZ`/`floorZ` formulas from `TrayParams` (`trayTopY`) — keep
+  them in sync with `layout.ts` `levels()`. Uniforms live in a ref and are mutated in an effect
   (never recreate the material; the shader patch compiles once).
 - **Printed look (`TrayMesh` shader, `ViewSettings.printLook`):** an analytic FDM
   height field perturbs the fragment normal — no geometry, no textures (OCC emits two
@@ -152,7 +177,7 @@ cols/rows/magnets), degraded preview during interaction.
   an analytic distance field from the compartment layout — `uRegions` is a 12×12 RGBA8
   texture mapping each cell to its region rect (c0, r0, c1, r1), `pocketRect()` rebuilds
   the pocket outline from it with the **same insets and corner radius as
-  `cad.worker.ts`** (change one, change both), and `topEdgeDist()` takes the nearest of
+  `layout.ts` `pocketRect()`** (change one, change both), and `topEdgeDist()` takes the nearest of
   the 4 cells around the closest grid corner plus the outer outline, so wall tops and
   junctions get loops along the wall. Feet bottoms just get fill. Anti-moiré is
   two-stage and both stages are in *periods per pixel* (`fwidth` of the pattern
@@ -185,8 +210,22 @@ cols/rows/magnets), degraded preview during interaction.
 - **Hydration/persistence:** saving is gated on a `hydrated` **state** flag, not a ref —
   a ref updates synchronously and lets the mount-commit save clobber the stored design
   under StrictMode double-effects. Don't "simplify" this back to a ref.
+- **Mesher invariants** (`trayMesher.ts`): every rounded rectangle is sampled by the one
+  `sampleRRect` (same corner order, same points per arc) so loft rings and concentric
+  iso-rings pair up index by index and coincident outlines (pocket side on the wall-inset
+  ring, pocket corner on the outer corner) produce *identical* floats — the edge
+  classification relies on that. `polygon-clipping` leaves a touching edge whole, so an
+  iso-ring edge that a pocket side runs along is split at the pocket's vertices before
+  classifying (`pocketVerticesOn`); dropping that split brings back the wall = 2.0 holes.
+  The wall thickness must stay a band boundary: bands ending at or before it skip clipping
+  entirely (pockets start at that inset). Triangles are wound by `Sink.tri` toward a
+  `want` direction, so a wrong normal shows up as a sign flip in `meshVolume`. Open-edge
+  checks will report collinear T-junctions (floor caps, underside seams, split top edges);
+  those are geometrically watertight. Node repro: `npx tsx` a script importing the module.
 - **Dev hooks** (dev builds only): `window.__cad` (requestMesh/requestExport — parse the
-  STL blob to verify dimensions), `window.__controls` (OrbitControls instance) and
+  STL blob to verify dimensions), `window.__buildTray` (the mesher; time it or diff it
+  against `__cad.requestMesh` for a spec), `window.__compare()` (bounds + volume of the
+  preview vs the CAD mesh; needs the CAD overlay toggle on), `window.__controls` (OrbitControls instance) and
   `window.__scene` (THREE.Scene — the default camera is *not* parented to it, so
   traversing from `__controls.object` finds nothing) and `window.__printUniforms` (the
   tray shader's uniform bag — tweak `uRelief`/`uSeamShade`/`uFillAngle` live).

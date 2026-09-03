@@ -17,7 +17,10 @@ import {
   type MeshData,
   type Region,
   type TrayParams,
+  type TraySpec,
 } from "@/lib/protocol";
+import { buildTrayGeometry, meshBounds, meshVolume, type TrayGeometry } from "@/lib/trayMesher";
+import { requestMesh } from "@/lib/cadClient";
 import {
   type Frame,
   type GridState,
@@ -28,6 +31,7 @@ import {
   canSplitSelection,
   expandSelection,
   fuse,
+  reframe,
   regionAt,
   split,
 } from "@/lib/grid";
@@ -183,7 +187,7 @@ interface ShadowState extends Frame {
   /** true while the pointer is down; false = committed, waiting for the rebuilt mesh. */
   live: boolean;
   /** Mesh that was current at commit time — the shadow stays until a newer one arrives. */
-  baseMesh: MeshData | null;
+  baseMesh: TrayGeometry | null;
 }
 
 /**
@@ -323,45 +327,22 @@ function Handle({
  * floating at the top of the walls (`y`), where it reads as the tray's new
  * outline rather than a mark on the ground.
  */
-function SizeShadow({ c0, r0, c1, r1, y }: Frame & { y: number }) {
-  const x0 = c0 * PITCH;
-  const x1 = c1 * PITCH;
-  const z0 = r0 * PITCH;
-  const z1 = r1 * PITCH;
-  const lines = useMemo(() => {
-    const pts: number[] = [];
-    for (let c = c0; c <= c1; c++) pts.push(c * PITCH, 0, z0, c * PITCH, 0, z1);
-    for (let r = r0; r <= r1; r++) pts.push(x0, 0, r * PITCH, x1, 0, r * PITCH);
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pts), 3));
-    return g;
-  }, [c0, r0, c1, r1, x0, x1, z0, z1]);
-  useEffect(() => () => lines.dispose(), [lines]);
+/**
+ * The pending footprint's size, pinned past its bottom-right corner at the wall
+ * top. The footprint itself is shown by the tray: the ghosted part a shrink
+ * removes and the half-coverage preview of what a grow adds.
+ */
+function SizeLabel({ c0, r0, c1, r1, y }: Frame & { y: number }) {
   return (
-    <group position={[0, y + 0.2, 0]}>
-      <mesh
-        position={[(x0 + x1) / 2, 0, (z0 + z1) / 2]}
-        rotation={[-Math.PI / 2, 0, 0]}
-        renderOrder={10}
-      >
-        <planeGeometry args={[x1 - x0, z1 - z0]} />
-        <meshBasicMaterial
-          color="#38bdf8"
-          transparent
-          opacity={0.07}
-          depthTest={false}
-          depthWrite={false}
-        />
-      </mesh>
-      <lineSegments geometry={lines} renderOrder={11}>
-        <lineBasicMaterial color="#7dd3fc" transparent opacity={0.4} depthTest={false} />
-      </lineSegments>
-      <Html position={[x1 + 14, 0, z1 + 14]} center style={{ pointerEvents: "none" }}>
-        <div className="rounded-md bg-sky-500 px-2 py-0.5 text-xs font-semibold whitespace-nowrap text-white tabular-nums">
-          {c1 - c0} × {r1 - r0}
-        </div>
-      </Html>
-    </group>
+    <Html
+      position={[c1 * PITCH + 14, y + 0.2, r1 * PITCH + 14]}
+      center
+      style={{ pointerEvents: "none" }}
+    >
+      <div className="rounded-md bg-sky-500 px-2 py-0.5 text-xs font-semibold whitespace-nowrap text-white tabular-nums">
+        {c1 - c0} × {r1 - r0}
+      </div>
+    </Html>
   );
 }
 
@@ -377,7 +358,7 @@ function SizeShadow({ c0, r0, c1, r1, y }: Frame & { y: number }) {
 function ResizeHandles3D({
   cols,
   rows,
-  mesh,
+  geometry,
   trayRef,
   topY,
   shadow: visible,
@@ -386,7 +367,8 @@ function ResizeHandles3D({
 }: {
   cols: number;
   rows: number;
-  mesh: MeshData | null;
+  /** The displayed tray; its identity marks when a resize's geometry has landed. */
+  geometry: TrayGeometry;
   /** The visible tray mesh, so handles it covers ignore the pointer. */
   trayRef: React.RefObject<THREE.Mesh | null>;
   /** Height of the wall top, where the shadow floats. */
@@ -423,7 +405,7 @@ function ResizeHandles3D({
     }
     s.x = 0;
     s.z = 0;
-  }, [mesh, getState]);
+  }, [geometry, getState]);
 
   const beginDrag = (side: Side, e: ThreeEvent<PointerEvent>) => {
     if (detachRef.current || e.nativeEvent.button !== 0) return;
@@ -473,7 +455,7 @@ function ResizeHandles3D({
       if (commit && !sameFrame(frame, start)) {
         // Keep the shadow up while the worker rebuilds; it clears once a mesh
         // newer than `baseMesh` lands, and the camera shift is applied then.
-        setShadow({ ...frame, side, live: false, baseMesh: mesh });
+        setShadow({ ...frame, side, live: false, baseMesh: geometry });
         shiftRef.current = { x: -frame.c0 * PITCH, z: -frame.r0 * PITCH };
         onResize(frame);
       } else {
@@ -518,7 +500,7 @@ function ResizeHandles3D({
   return (
     <group>
       {visible && (
-        <SizeShadow c0={visible.c0} r0={visible.r0} c1={visible.c1} r1={visible.r1} y={topY} />
+        <SizeLabel c0={visible.c0} r0={visible.r0} c1={visible.c1} r1={visible.r1} y={topY} />
       )}
       {SIDES.map((side) => (
         <Handle
@@ -759,22 +741,29 @@ function makeRegionTexture(): THREE.DataTexture {
  * two triangles per flat face), so this must stay per-fragment.
  */
 function TrayMesh({
-  mesh,
+  geometry: tray,
   sel,
   grid,
   params,
   view,
   ghost,
+  ghostAlpha = 0.25,
+  ghostInside = 1,
   pickRef,
 }: {
-  mesh: MeshData;
+  /** Procedural preview geometry, already in the world frame (lib/trayMesher). */
+  geometry: TrayGeometry;
   sel: Region | null;
   /** Compartment layout — the printed look derives its perimeter loops from it. */
   grid: GridState;
   params: TrayParams;
   view: ViewSettings;
-  /** Pending resize footprint (displayed-world units): everything outside it ghosts. */
+  /** Resize footprint (displayed-world units): fragments outside it get `ghostAlpha`, inside `ghostInside`. */
   ghost: Frame | null;
+  /** Coverage outside the ghost box; 0.25 = the part a shrink removes. */
+  ghostAlpha?: number;
+  /** Coverage inside the ghost box; 0 hides the future tray where the current one still stands. */
+  ghostInside?: number;
   pickRef?: React.Ref<THREE.Mesh>;
 }) {
   const uniforms = useRef({
@@ -782,10 +771,11 @@ function TrayMesh({
     uSelMax: { value: new THREE.Vector3() },
     uSelActive: { value: 0 },
     uGhostOn: { value: 0 },
-    /** Kept box in world xz; fragments outside get `uGhostAlpha`. */
+    /** Ghost box in world xz; fragments outside get `uGhostAlpha`, inside `uGhostInside`. */
     uGhostMin: { value: new THREE.Vector2() },
     uGhostMax: { value: new THREE.Vector2() },
     uGhostAlpha: { value: 0.25 },
+    uGhostInside: { value: 1 },
     uPrint: { value: 0 },
     uLayerH: { value: 0.2 },
     uLineW: { value: NOZZLE_LINE_W },
@@ -809,13 +799,15 @@ function TrayMesh({
   useEffect(() => {
     const u = uniforms.current;
     u.uGhostOn.value = ghost ? 1 : 0;
+    u.uGhostAlpha.value = ghostAlpha;
+    u.uGhostInside.value = ghostInside;
     if (!ghost) return;
     // Interior walls straddle the grid line by wall/2: keep the one that
     // becomes the new outer wall solid, so the kept part reads as a whole tray.
     const m = params.wall / 2;
     u.uGhostMin.value.set(ghost.c0 * PITCH - m, ghost.r0 * PITCH - m);
     u.uGhostMax.value.set(ghost.c1 * PITCH + m, ghost.r1 * PITCH + m);
-  }, [ghost, params.wall]);
+  }, [ghost, ghostAlpha, ghostInside, params.wall]);
 
   useEffect(() => {
     const u = uniforms.current;
@@ -868,12 +860,15 @@ function TrayMesh({
       shader.vertexShader = shader.vertexShader
         .replace(
           "#include <common>",
-          "#include <common>\nvarying vec3 vWorldPos;\nvarying vec3 vWorldNormal;",
+          "#include <common>\nvarying vec3 vWorldPos;\nvarying vec3 vLocalPos;\nvarying vec3 vWorldNormal;",
         )
         .replace(
           "#include <worldpos_vertex>",
           "#include <worldpos_vertex>\n" +
             "vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;\n" +
+            // Tray-local = world with the tray's cell (0,0) at the origin; the
+            // layout-dependent print pattern uses it so a translated preview stays aligned.
+            "vLocalPos = transformed;\n" +
             "vWorldNormal = normalize(mat3(modelMatrix) * objectNormal);",
         );
       shader.fragmentShader = shader.fragmentShader
@@ -881,10 +876,12 @@ function TrayMesh({
           "#include <common>",
           `#include <common>
 varying vec3 vWorldPos;
+varying vec3 vLocalPos;
 uniform float uGhostOn;
 uniform vec2 uGhostMin;
 uniform vec2 uGhostMax;
 uniform float uGhostAlpha;
+uniform float uGhostInside;
 varying vec3 vWorldNormal;
 uniform vec3 uSelMin;
 uniform vec3 uSelMax;
@@ -974,9 +971,11 @@ float fdmHash(float x) { return fract(sin(x * 12.9898) * 43758.5453); }`,
         .replace(
           "vec4 diffuseColor = vec4( diffuse, opacity );",
           `vec4 diffuseColor = vec4( diffuse, opacity );
-if (uGhostOn > 0.5 && (vWorldPos.x < uGhostMin.x || vWorldPos.x > uGhostMax.x ||
-    vWorldPos.z < uGhostMin.y || vWorldPos.z > uGhostMax.y)) {
-  diffuseColor.a *= uGhostAlpha;
+if (uGhostOn > 0.5) {
+  bool outsideGhost = vWorldPos.x < uGhostMin.x || vWorldPos.x > uGhostMax.x ||
+    vWorldPos.z < uGhostMin.y || vWorldPos.z > uGhostMax.y;
+  diffuseColor.a *= outsideGhost ? uGhostAlpha : uGhostInside;
+  if (diffuseColor.a < 0.01) discard;
 }
 if (uSelActive > 0.5) {
   vec3 n = normalize(vWorldNormal);
@@ -1004,10 +1003,10 @@ if (uPrint > 0.5) {
   vec2 dir = vec2(cos(uFillAngle), sin(uFillAngle));
   vec2 away = dir;
   float dEdge = 1e9;
-  if (nw.y > 0.5) dEdge = topEdgeDist(vWorldPos.xz, away);
+  if (nw.y > 0.5) dEdge = topEdgeDist(vLocalPos.xz, away);
   bool perim = dEdge < uPerims * uLineW;
   vec2 tdir = perim ? away : dir;
-  float ls = (perim ? dEdge : dot(vWorldPos.xz, dir)) / uLineW;
+  float ls = (perim ? dEdge : dot(vLocalPos.xz, dir)) / uLineW;
   float uy = 2.0 * fract(ly) - 1.0;
   float us = 2.0 * fract(ls) - 1.0;
   // Screen footprint of each pattern in periods per pixel: soften the profile
@@ -1047,6 +1046,7 @@ if (uPrint > 0.5) {
         uGhostMin: u.uGhostMin,
         uGhostMax: u.uGhostMax,
         uGhostAlpha: u.uGhostAlpha,
+        uGhostInside: u.uGhostInside,
       });
       shader.vertexShader = shader.vertexShader
         .replace("#include <common>", "#include <common>\nvarying vec3 vWorldPos;")
@@ -1062,64 +1062,133 @@ varying vec3 vWorldPos;
 uniform float uGhostOn;
 uniform vec2 uGhostMin;
 uniform vec2 uGhostMax;
-uniform float uGhostAlpha;`,
+uniform float uGhostAlpha;
+uniform float uGhostInside;`,
         )
         .replace(
           "vec4 diffuseColor = vec4( diffuse, opacity );",
           `vec4 diffuseColor = vec4( diffuse, opacity );
-if (uGhostOn > 0.5 && (vWorldPos.x < uGhostMin.x || vWorldPos.x > uGhostMax.x ||
-    vWorldPos.z < uGhostMin.y || vWorldPos.z > uGhostMax.y)) {
-  diffuseColor.a *= uGhostAlpha;
+if (uGhostOn > 0.5) {
+  bool outsideGhost = vWorldPos.x < uGhostMin.x || vWorldPos.x > uGhostMax.x ||
+    vWorldPos.z < uGhostMin.y || vWorldPos.z > uGhostMax.y;
+  diffuseColor.a *= outsideGhost ? uGhostAlpha : uGhostInside;
+  if (diffuseColor.a < 0.01) discard;
 }`,
         );
     },
     [],
   );
 
-  const { geometry, edgeGeometry, offset } = useMemo(() => {
+  // The mesher already emits flat-shaded, non-indexed triangles in the world
+  // frame (x cols, y up, z rows), so the geometry is uploaded as is.
+  const { geometry, edgeGeometry } = useMemo(() => {
     const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(mesh.vertices, 3));
-    g.setIndex(new THREE.BufferAttribute(mesh.triangles, 1));
-    const flat = g.toNonIndexed();
-    g.dispose();
-    flat.computeVertexNormals();
+    g.setAttribute("position", new THREE.BufferAttribute(tray.positions, 3));
+    g.setAttribute("normal", new THREE.BufferAttribute(tray.normals, 3));
     const e = new THREE.BufferGeometry();
-    e.setAttribute("position", new THREE.BufferAttribute(mesh.edges, 3));
-    // The worker puts row 0 at its top y; shifting by -depth (before the -90°
-    // X rotation) lands the tray in [0,w]×[0,d] with row 0 at z's start — the
-    // same top-left origin the resize shadow uses. The depth
-    // comes from this mesh's own bounds (not the grid props) so a stale mesh
-    // stays put while a resize rebuilds.
-    flat.computeBoundingBox();
-    const off: [number, number, number] = [0, -((flat.boundingBox?.max.y ?? 0) + CLEAR), 0];
-    return { geometry: flat, edgeGeometry: e, offset: off };
-  }, [mesh]);
+    e.setAttribute("position", new THREE.BufferAttribute(tray.edges, 3));
+    return { geometry: g, edgeGeometry: e };
+  }, [tray]);
+  // Geometries handed in as props aren't auto-disposed by R3F when they change.
+  useEffect(
+    () => () => {
+      geometry.dispose();
+      edgeGeometry.dispose();
+    },
+    [geometry, edgeGeometry],
+  );
 
   return (
+    <>
+      <mesh ref={pickRef} geometry={geometry} castShadow receiveShadow>
+        <meshStandardMaterial
+          color="#59B9BA"
+          roughness={0.55}
+          metalness={0.05}
+          polygonOffset
+          polygonOffsetFactor={1}
+          polygonOffsetUnits={1}
+          // The ghost alpha goes through MSAA coverage, not blending: the
+          // material stays opaque (depth-sorted, no self-overlap artifacts)
+          // and the multisampled canvas resolves 25% coverage to a clean fade.
+          alphaToCoverage
+          onBeforeCompile={onBeforeCompile}
+        />
+      </mesh>
+      <lineSegments geometry={edgeGeometry}>
+        <lineBasicMaterial
+          color="#0f3536"
+          transparent
+          opacity={0.4}
+          onBeforeCompile={onBeforeCompileEdges}
+        />
+      </lineSegments>
+    </>
+  );
+}
+
+/**
+ * Dev builds only: the CAD kernel's B-rep edges for the same spec, drawn in red
+ * over the procedural preview, plus `window.__compare()` (bounds and volume of
+ * both) — the guard against the mesher and the export drifting apart.
+ */
+function CadOverlay({ spec, geometry }: { spec: TraySpec; geometry: TrayGeometry }) {
+  const [cad, setCad] = useState<MeshData | null>(null);
+  const seq = useRef(0);
+  useEffect(() => {
+    const id = ++seq.current;
+    const timer = setTimeout(() => {
+      requestMesh(spec)
+        .then((m) => {
+          if (seq.current === id) setCad(m);
+        })
+        .catch(() => {});
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [spec]);
+
+  // The worker's frame is OCC's (z up, row 0 at the highest y): rotate −90°
+  // about x after shifting the mesh's own top y to the origin.
+  const built = useMemo(() => {
+    if (!cad) return null;
+    let maxY = -Infinity;
+    for (let i = 1; i < cad.vertices.length; i += 3) maxY = Math.max(maxY, cad.vertices[i]);
+    const e = new THREE.BufferGeometry();
+    e.setAttribute("position", new THREE.BufferAttribute(cad.edges, 3));
+    return { edges: e, offsetY: -(maxY + CLEAR) };
+  }, [cad]);
+  useEffect(() => () => built?.edges.dispose(), [built]);
+
+  useEffect(() => {
+    if (!cad || !built) return;
+    const compare = () => {
+      // Expand the indexed CAD mesh into world-frame triangles.
+      const { vertices: v, triangles: t } = cad;
+      const soup = new Float32Array(t.length * 3);
+      for (let i = 0; i < t.length; i++) {
+        const k = t[i] * 3;
+        soup[i * 3] = v[k];
+        soup[i * 3 + 1] = v[k + 2];
+        soup[i * 3 + 2] = -(v[k + 1] + built.offsetY);
+      }
+      const cadVol = meshVolume(soup);
+      const preVol = meshVolume(geometry.positions);
+      return {
+        cad: { bounds: meshBounds(soup), volume: cadVol },
+        preview: { bounds: meshBounds(geometry.positions), volume: preVol },
+        volumeDiffPct: ((preVol - cadVol) / cadVol) * 100,
+      };
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (window as any).__compare = compare;
+  }, [cad, built, geometry]);
+
+  if (!built) return null;
+  return (
     <group rotation={[-Math.PI / 2, 0, 0]}>
-      <group position={offset}>
-        <mesh ref={pickRef} geometry={geometry} castShadow receiveShadow>
-          <meshStandardMaterial
-            color="#59B9BA"
-            roughness={0.55}
-            metalness={0.05}
-            polygonOffset
-            polygonOffsetFactor={1}
-            polygonOffsetUnits={1}
-            // The ghost alpha goes through MSAA coverage, not blending: the
-            // material stays opaque (depth-sorted, no self-overlap artifacts)
-            // and the multisampled canvas resolves 25% coverage to a clean fade.
-            alphaToCoverage
-            onBeforeCompile={onBeforeCompile}
-          />
-        </mesh>
-        <lineSegments geometry={edgeGeometry}>
-          <lineBasicMaterial
-            color="#0f3536"
-            transparent
-            opacity={0.4}
-            onBeforeCompile={onBeforeCompileEdges}
-          />
+      <group position={[0, built.offsetY, 0]}>
+        <lineSegments geometry={built.edges}>
+          <lineBasicMaterial color="#ff3b30" transparent opacity={0.9} depthTest={false} />
         </lineSegments>
       </group>
     </group>
@@ -1127,7 +1196,8 @@ if (uGhostOn > 0.5 && (vWorldPos.x < uGhostMin.x || vWorldPos.x > uGhostMax.x ||
 }
 
 export default function Viewer({
-  mesh,
+  geometry,
+  spec,
   grid,
   params,
   onResize,
@@ -1135,7 +1205,10 @@ export default function Viewer({
   view,
   viewMappingId = DEFAULT_MAPPING_ID,
 }: {
-  mesh: MeshData | null;
+  /** The tray to draw, meshed synchronously from `spec` by the state owner. */
+  geometry: TrayGeometry;
+  /** The same spec, for the dev-only CAD comparison overlay. */
+  spec: TraySpec;
   grid: GridState;
   /** Needed to locate the compartment interiors for the selection tint. */
   params: TrayParams;
@@ -1157,7 +1230,27 @@ export default function Viewer({
   // handle placement) and the tray (ghosting outside it) render from it. A
   // committed shadow outlives its drag until a mesh newer than `baseMesh` lands.
   const [shadow, setShadow] = useState<ShadowState | null>(null);
-  const shadowVisible = shadow && (shadow.live || shadow.baseMesh === mesh) ? shadow : null;
+  const shadowVisible = shadow && (shadow.live || shadow.baseMesh === geometry) ? shadow : null;
+  // Grow preview: while the pending footprint reaches past the current tray, mesh
+  // the future tray (its cell (0,0) lands at the frame's origin) and draw it at
+  // half coverage where the current tray isn't — the "add" counterpart of the
+  // 25% ghost a shrink puts on the part being removed.
+  const fc0 = shadowVisible?.c0 ?? 0;
+  const fr0 = shadowVisible?.r0 ?? 0;
+  const fc1 = shadowVisible?.c1 ?? cols;
+  const fr1 = shadowVisible?.r1 ?? rows;
+  const grows = shadowVisible !== null && (fc0 < 0 || fr0 < 0 || fc1 > cols || fr1 > rows);
+  const preview = useMemo(() => {
+    if (!grows) return null;
+    const next = reframe(grid, { c0: fc0, r0: fr0, c1: fc1, r1: fr1 });
+    const spec: TraySpec = { ...params, cols: next.cols, rows: next.rows, regions: allRegions(next) };
+    return {
+      geometry: buildTrayGeometry(spec),
+      grid: next,
+      offset: [fc0 * PITCH, 0, fr0 * PITCH] as [number, number, number],
+    };
+  }, [grows, fc0, fr0, fc1, fr1, grid, params]);
+  const footprint = useMemo<Frame>(() => ({ c0: 0, r0: 0, c1: cols, r1: rows }), [cols, rows]);
   // A shrink (2D or 3D handles) can leave the selection out of bounds; treat as cleared.
   const sel = selection && selection.c1 < cols && selection.r1 < rows ? selection : null;
 
@@ -1199,21 +1292,36 @@ export default function Viewer({
         <directionalLight position={[150, 300, 200]} intensity={1.4} />
         <directionalLight position={[-200, 150, -100]} intensity={0.4} />
         <directionalLight position={[50, -200, 80]} intensity={0.5} />
-        {mesh && (
-          <TrayMesh
-            mesh={mesh}
-            sel={sel}
-            grid={grid}
-            params={params}
-            view={view}
-            ghost={shadowVisible}
-            pickRef={trayPickRef}
-          />
+        <TrayMesh
+          geometry={geometry}
+          sel={sel}
+          grid={grid}
+          params={params}
+          view={view}
+          ghost={shadowVisible}
+          pickRef={trayPickRef}
+        />
+        {preview && (
+          <group position={preview.offset}>
+            <TrayMesh
+              geometry={preview.geometry}
+              sel={null}
+              grid={preview.grid}
+              params={params}
+              view={view}
+              ghost={footprint}
+              ghostInside={0}
+              ghostAlpha={0.5}
+            />
+          </group>
+        )}
+        {process.env.NODE_ENV === "development" && view.cadOverlay && (
+          <CadOverlay spec={spec} geometry={geometry} />
         )}
         <ResizeHandles3D
           cols={cols}
           rows={rows}
-          mesh={mesh}
+          geometry={geometry}
           trayRef={trayPickRef}
           topY={trayTopY(params)}
           shadow={shadowVisible}

@@ -6,23 +6,25 @@ import {
   type Shape3D,
   type Sketch,
 } from "replicad";
+import { PITCH, BASE_H, type TraySpec, type WorkerRequest, type WorkerResponse } from "../lib/protocol";
 import {
-  PITCH,
-  CLEAR,
-  R_OUT,
-  BASE_H,
-  LIP_H,
-  type TraySpec,
-  type WorkerRequest,
-  type WorkerResponse,
-} from "../lib/protocol";
+  FOOT_RINGS,
+  LIP_SOCKET,
+  MAGNET_D,
+  MAGNET_H,
+  footRing,
+  hasPockets,
+  levels,
+  lipRing,
+  magnetCenters,
+  outerOutline,
+  pocketRect,
+  type RRect,
+} from "../lib/layout";
 
-// --- Gridfinity spec constants (mm) ---
-// Base foot profile, bottom to top: 0.8 chamfer, 1.8 straight, 2.15 chamfer (total BASE_H)
-const FOOT_TOP = PITCH - 2 * CLEAR; // 41.5, per unit
-const MAGNET_D = 6.5;
-const MAGNET_H = 2.4;
-const MAGNET_SPREAD = 13; // from foot center
+// Every dimension comes from lib/layout.ts, shared with the preview mesher.
+// The worker's frame is OCC's: XY is the bed, Z is up, and plan z (rows, growing
+// screen-down) maps to y = PITCH·rows − z so row 0 ends up at the highest y.
 
 let ocReady: Promise<void> | null = null;
 function init(): Promise<void> {
@@ -38,8 +40,13 @@ function init(): Promise<void> {
   return ocReady;
 }
 
-function rect(w: number, d: number, r: number, cx: number, cy: number, z: number): Sketch {
-  return sketchRoundedRectangle(w, d, Math.max(0.01, r), { plane: "XY", origin: [cx, cy, z] });
+/** A plan rounded rectangle as a sketch at height z. */
+function rectSketch(rr: RRect, rows: number, z: number): Sketch {
+  const w = rr.x1 - rr.x0;
+  const d = rr.z1 - rr.z0;
+  const cx = (rr.x0 + rr.x1) / 2;
+  const cy = PITCH * rows - (rr.z0 + rr.z1) / 2;
+  return sketchRoundedRectangle(w, d, Math.max(0.01, rr.r), { plane: "XY", origin: [cx, cy, z] });
 }
 
 function fuseAll(shapes: Shape3D[]): Shape3D {
@@ -54,62 +61,43 @@ function fuseAll(shapes: Shape3D[]): Shape3D {
   return current[0];
 }
 
-/** One gridfinity foot under a unit cell, z 0 -> BASE_H. */
-function foot(cx: number, cy: number): Shape3D {
-  const bottom = rect(FOOT_TOP - 5.9, FOOT_TOP - 5.9, 0.8, cx, cy, 0);
-  return bottom.loftWith(
-    [
-      rect(FOOT_TOP - 4.3, FOOT_TOP - 4.3, 1.6, cx, cy, 0.8),
-      rect(FOOT_TOP - 4.3, FOOT_TOP - 4.3, 1.6, cx, cy, 2.6),
-      rect(FOOT_TOP, FOOT_TOP, R_OUT, cx, cy, BASE_H),
-    ],
+/** One gridfinity foot under unit cell (c, r), z 0 -> BASE_H. */
+function foot(c: number, r: number, rows: number): Shape3D {
+  const [bottom, ...rest] = FOOT_RINGS;
+  return rectSketch(footRing(c, r, bottom), rows, bottom.z).loftWith(
+    rest.map((ring) => rectSketch(footRing(c, r, ring), rows, ring.z)),
     { ruled: true },
   );
 }
 
 export function buildTray(spec: TraySpec): Shape3D {
-  const { cols, rows, wall } = spec;
-  const W = PITCH * cols - 2 * CLEAR;
-  const D = PITCH * rows - 2 * CLEAR;
-  const cx = (PITCH * cols) / 2;
-  const cy = (PITCH * rows) / 2;
-  const topZ = Math.max(spec.heightMm, BASE_H + 1) + (spec.lip ? LIP_H : 0);
-  const floorZ = Math.min(BASE_H + Math.max(spec.floor, 0), topZ - 0.5);
+  const { cols, rows } = spec;
+  const lv = levels(spec);
+  const outer = outerOutline(cols, rows);
 
   // Body wall + one foot per unit cell (feet stay per-unit even under fused compartments)
-  const parts: Shape3D[] = [rect(W, D, R_OUT, cx, cy, BASE_H).extrude(topZ - BASE_H)];
+  const parts: Shape3D[] = [rectSketch(outer, rows, BASE_H).extrude(lv.topZ - BASE_H)];
   for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      parts.push(foot(PITCH * c + PITCH / 2, PITCH * (rows - 1 - r) + PITCH / 2));
-    }
+    for (let c = 0; c < cols; c++) parts.push(foot(c, r, rows));
   }
   let tray = fuseAll(parts);
 
-  // Compartment pockets. Grid row 0 is the top of the 2D editor -> highest Y in 3D.
-  const pockets: Shape3D[] = [];
-  for (const reg of spec.regions) {
-    const x0 = PITCH * reg.c0 + (reg.c0 === 0 ? CLEAR + wall : wall / 2);
-    const x1 = PITCH * (reg.c1 + 1) - (reg.c1 === cols - 1 ? CLEAR + wall : wall / 2);
-    const y1 = PITCH * (rows - reg.r0) - (reg.r0 === 0 ? CLEAR + wall : wall / 2);
-    const y0 = PITCH * (rows - 1 - reg.r1) + (reg.r1 === rows - 1 ? CLEAR + wall : wall / 2);
-    const w = x1 - x0;
-    const d = y1 - y0;
-    if (w < 1 || d < 1 || floorZ >= topZ - 0.25) continue;
-    const r = Math.max(0.4, Math.min(R_OUT - wall, w / 2 - 0.1, d / 2 - 0.1));
-    pockets.push(
-      rect(w, d, r, x0 + w / 2, y0 + d / 2, floorZ).extrude(topZ - floorZ + 1),
-    );
+  // Compartment pockets
+  if (hasPockets(lv)) {
+    const pockets: Shape3D[] = [];
+    for (const reg of spec.regions) {
+      const rr = pocketRect(spec, reg);
+      if (!rr) continue;
+      pockets.push(rectSketch(rr, rows, lv.floorZ).extrude(lv.topZ - lv.floorZ + 1));
+    }
+    if (pockets.length > 0) tray = tray.cut(fuseAll(pockets));
   }
-  if (pockets.length > 0) tray = tray.cut(fuseAll(pockets));
 
-  // Stacking lip: cut a socket (mirror of the foot profile + clearance) into the top rim.
+  // Stacking lip: cut the socket loft into the top rim.
   if (spec.lip) {
-    const socket = rect(W + 0.5, D + 0.5, R_OUT + 0.25, cx, cy, topZ + 0.5).loftWith(
-      [
-        rect(W - 4.0, D - 4.0, 1.75, cx, cy, topZ - 1.75),
-        rect(W - 4.0, D - 4.0, 1.75, cx, cy, topZ - 3.55),
-        rect(W - 5.6, D - 5.6, 0.95, cx, cy, topZ - 4.35),
-      ],
+    const [first, ...rest] = LIP_SOCKET;
+    const socket = rectSketch(lipRing(outer, first), rows, lv.topZ + first.dz).loftWith(
+      rest.map((ring) => rectSketch(lipRing(outer, ring), rows, lv.topZ + ring.dz)),
       { ruled: true },
     );
     tray = tray.cut(socket);
@@ -119,18 +107,10 @@ export function buildTray(spec: TraySpec): Shape3D {
     const holes: Shape3D[] = [];
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
-        const fx = PITCH * c + PITCH / 2;
-        const fy = PITCH * r + PITCH / 2;
-        for (const sx of [-1, 1]) {
-          for (const sy of [-1, 1]) {
-            holes.push(
-              makeCylinder(MAGNET_D / 2, MAGNET_H + 0.01, [
-                fx + sx * MAGNET_SPREAD,
-                fy + sy * MAGNET_SPREAD,
-                -0.005,
-              ]),
-            );
-          }
+        for (const m of magnetCenters(c, r)) {
+          holes.push(
+            makeCylinder(MAGNET_D / 2, MAGNET_H + 0.01, [m.x, PITCH * rows - m.z, -0.005]),
+          );
         }
       }
     }

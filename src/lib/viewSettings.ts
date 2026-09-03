@@ -6,9 +6,11 @@ export interface ViewSettings {
   printLook: boolean;
   /** Layer height in mm for the printed look. */
   layerHeight: number;
+  /** Dev builds only: draw the CAD kernel's edges in red over the procedural preview. */
+  cadOverlay: boolean;
 }
 
-export const DEFAULT_VIEW: ViewSettings = { printLook: true, layerHeight: 0.2 };
+export const DEFAULT_VIEW: ViewSettings = { printLook: true, layerHeight: 0.2, cadOverlay: false };
 
 /** Nozzle-line width used for the top-fill beads (0.4mm nozzle, slightly squished). */
 export const NOZZLE_LINE_W = 0.42;

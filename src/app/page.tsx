@@ -1,52 +1,15 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import Toolbar from "@/components/Toolbar";
 import { GridState, allRegions, initialGrid, reframe } from "@/lib/grid";
-import { requestExport, requestMesh, downloadBlob } from "@/lib/cadClient";
-import { traySizeMm, type MeshData, type TrayParams, type TraySpec } from "@/lib/protocol";
+import { requestExport, downloadBlob } from "@/lib/cadClient";
+import { traySizeMm, type TrayParams, type TraySpec } from "@/lib/protocol";
+import { buildTrayGeometry } from "@/lib/trayMesher";
 import { DEFAULT_VIEW, type ViewSettings } from "@/lib/viewSettings";
 
 const Viewer = dynamic(() => import("@/components/Viewer"), { ssr: false });
-
-type Status = "init" | "building" | "ready" | "error";
-
-function useTrayMesh(spec: TraySpec) {
-  const [mesh, setMesh] = useState<MeshData | null>(null);
-  const [status, setStatus] = useState<Status>("init");
-  const [error, setError] = useState<string | null>(null);
-  const seq = useRef(0);
-
-  useEffect(() => {
-    const id = ++seq.current;
-    const timer = setTimeout(() => {
-      setStatus((s) => (s === "init" ? "init" : "building"));
-      requestMesh(spec)
-        .then((m) => {
-          if (seq.current !== id) return;
-          setMesh(m);
-          setStatus("ready");
-          setError(null);
-        })
-        .catch((err: Error) => {
-          if (seq.current !== id) return;
-          setStatus("error");
-          setError(err.message);
-        });
-    }, 150);
-    return () => clearTimeout(timer);
-  }, [spec]);
-
-  return { mesh, status, error };
-}
-
-const STATUS_COLOR: Record<Status, string> = {
-  init: "bg-neutral-500 animate-pulse",
-  building: "bg-amber-400 animate-pulse",
-  ready: "bg-emerald-500",
-  error: "bg-red-500",
-};
 
 const STORAGE_KEY = "gridfinity-tray-v1";
 
@@ -108,8 +71,9 @@ export default function Home() {
     () => ({ cols: grid.cols, rows: grid.rows, regions: allRegions(grid), ...params }),
     [grid, params],
   );
-
-  const { mesh, status, error } = useTrayMesh(spec);
+  // The preview is meshed synchronously from the layout — every change shows on
+  // the next frame. The CAD kernel (a worker, loaded on first use) only builds exports.
+  const geometry = useMemo(() => buildTrayGeometry(spec), [spec]);
   const size = traySizeMm(spec);
   const fmt = (v: number) => String(Number(v.toFixed(2)));
 
@@ -132,7 +96,8 @@ export default function Home() {
         {/* Mounted after the restore: the Viewer frames the tray once, at mount. */}
         {hydrated && (
           <Viewer
-            mesh={mesh}
+            geometry={geometry}
+            spec={spec}
             grid={grid}
             params={params}
             onResize={(frame) => setGrid((g) => reframe(g, frame))}
@@ -148,23 +113,14 @@ export default function Home() {
           onExport={handleExport}
           exporting={exporting}
         />
-        {(error || exportError) && (
+        {exportError && (
           <p className="absolute top-16 left-3 z-10 max-w-sm text-xs break-words text-red-400">
-            {error ?? exportError}
+            {exportError}
           </p>
         )}
-        <div
-          className={`absolute top-3 right-3 h-2.5 w-2.5 rounded-full ${STATUS_COLOR[status]}`}
-          title={status === "error" ? (error ?? "error") : status === "init" ? "loading CAD kernel…" : status}
-        />
         <p className="absolute right-3 bottom-3 text-xs tabular-nums text-neutral-500">
           {fmt(size.w)} × {fmt(size.d)} × {fmt(size.h)} mm
         </p>
-        {status === "init" && (
-          <p className="absolute inset-x-0 top-[45%] text-center text-sm text-neutral-500">
-            Loading CAD kernel…
-          </p>
-        )}
     </main>
   );
 }

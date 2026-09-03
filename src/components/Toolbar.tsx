@@ -208,6 +208,13 @@ export default function Toolbar({
                     onValue={(v) => setView({ layerHeight: v })}
                   />
                 )}
+                {process.env.NODE_ENV === "development" && (
+                  <Toggle
+                    label="CAD overlay (dev)"
+                    checked={view.cadOverlay}
+                    onChecked={(v) => setView({ cadOverlay: v })}
+                  />
+                )}
               </div>
             </Popover.Popup>
           </Popover.Positioner>
