@@ -2,8 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import GridEditor from "@/components/GridEditor";
-import Sidebar from "@/components/Sidebar";
+import Toolbar from "@/components/Toolbar";
 import { GridState, allRegions, initialGrid, resize } from "@/lib/grid";
 import { requestExport, requestMesh, downloadBlob } from "@/lib/cadClient";
 import { traySizeMm, type MeshData, type TrayParams, type TraySpec } from "@/lib/protocol";
@@ -129,23 +128,7 @@ export default function Home() {
   };
 
   return (
-    <div className="flex h-dvh bg-neutral-950 text-neutral-200">
-      <aside className="flex w-80 shrink-0 flex-col gap-5 overflow-y-auto border-r border-neutral-800 p-4">
-        <GridEditor state={grid} onChange={setGrid} />
-        <hr className="border-neutral-800" />
-        <Sidebar
-          params={params}
-          onChange={setParams}
-          view={view}
-          onViewChange={setView}
-          onExport={handleExport}
-          exporting={exporting}
-        />
-        {(error || exportError) && (
-          <p className="text-xs break-words text-red-400">{error ?? exportError}</p>
-        )}
-      </aside>
-      <main className="relative flex-1">
+    <main className="relative h-dvh bg-neutral-950 text-neutral-200">
         <Viewer
           mesh={mesh}
           grid={grid}
@@ -154,11 +137,24 @@ export default function Home() {
           onGridChange={setGrid}
           view={view}
         />
+        <Toolbar
+          params={params}
+          onChange={setParams}
+          view={view}
+          onViewChange={setView}
+          onExport={handleExport}
+          exporting={exporting}
+        />
+        {(error || exportError) && (
+          <p className="absolute top-16 left-3 z-10 max-w-sm text-xs break-words text-red-400">
+            {error ?? exportError}
+          </p>
+        )}
         <div
           className={`absolute top-3 right-3 h-2.5 w-2.5 rounded-full ${STATUS_COLOR[status]}`}
           title={status === "error" ? (error ?? "error") : status === "init" ? "loading CAD kernel…" : status}
         />
-        <p className="absolute bottom-3 left-4 text-xs tabular-nums text-neutral-500">
+        <p className="absolute right-3 bottom-3 text-xs tabular-nums text-neutral-500">
           {fmt(size.w)} × {fmt(size.d)} × {fmt(size.h)} mm
         </p>
         {status === "init" && (
@@ -166,7 +162,6 @@ export default function Home() {
             Loading CAD kernel…
           </p>
         )}
-      </main>
-    </div>
+    </main>
   );
 }

@@ -284,7 +284,7 @@ interface ShadowState {
 /**
  * resize.svg's two chevrons as one flat geometry: centred, `HANDLE_ICON` tall,
  * lying on the ground with SVG-down mapped to +z. Handle drags happen in the
- * top view, where +z is screen-down, so the icon reads as it does in the 2D editor.
+ * top view, where +z is screen-down, so the chevrons read the way the tray grows.
  */
 function useResizeIconGeometry(): THREE.BufferGeometry {
   const { paths } = useLoader(SVGLoader, RESIZE_ICON_URL);
@@ -581,7 +581,7 @@ function ResizeHandles3D({
 
 /**
  * Drag-select cells on the tray with the left button (only while the active
- * view mapping leaves it free), with the 2D editor's spreadsheet semantics.
+ * view mapping leaves it free), with spreadsheet-style selection semantics.
  * Picking raycasts the visible tray mesh first — so clicks on tall walls land
  * where the user points — and falls back to the ground plane off the tray.
  */
@@ -1064,7 +1064,7 @@ if (uPrint > 0.5) {
     e.setAttribute("position", new THREE.BufferAttribute(mesh.edges, 3));
     // The worker puts row 0 at its top y; shifting by -depth (before the -90°
     // X rotation) lands the tray in [0,w]×[0,d] with row 0 at z's start — the
-    // same top-left origin the 2D editor and the resize shadow use. The depth
+    // same top-left origin the resize shadow uses. The depth
     // comes from this mesh's own bounds (not the grid props) so a stale mesh
     // stays put while a resize rebuilds.
     flat.computeBoundingBox();

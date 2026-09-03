@@ -12,10 +12,12 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 
 Visual web app to design [gridfinity](https://gridfinity.xyz) trays and export them as
 **binary STL** and **real STEP** (ISO-10303-21). The user sizes a grid of 42mm units by
-dragging (max 12×12, in the 2D panel or via the 3D handles), selects cells and **fuses**
+dragging the 3D handles (max 12×12), selects cells in the 3D view and **fuses**
 them into larger compartments
-(spreadsheet-style cell merging), tweaks parameters in a sidebar, and watches a live 3D
-preview. Everything is client-side; there is no backend.
+(spreadsheet-style cell merging), tweaks parameters in a floating Settings popover, and
+watches a live 3D preview. The whole UI is the 3D view plus two top-left buttons
+(Settings, Export); the former sidebar and 2D grid editor were removed in Sept 2026.
+Everything is client-side; there is no backend.
 
 **Stack:** Next.js 16.3 (Turbopack) · TypeScript · Tailwind v4 · Base UI
 (`@base-ui/react` — NOT `@base-ui-components/react`, that package doesn't exist) ·
@@ -33,8 +35,7 @@ react-three-fiber 9 + drei 10 · replicad 1.0 over OpenCASCADE WASM, in a web wo
 | File | Role |
 |---|---|
 | `src/app/page.tsx` | State owner: `GridState` + `TrayParams` → `TraySpec`; 150ms-debounced, latest-wins mesh requests; plus render-only `ViewSettings`; localStorage persistence (`gridfinity-tray-v1`); export handler; size readout |
-| `src/components/GridEditor.tsx` | The 2D grid: drag-select, drag handles to resize, Fuse/Split buttons |
-| `src/components/Sidebar.tsx` | Base UI number fields + switches for params, printed-look switch + layer height, export buttons |
+| `src/components/Toolbar.tsx` | Floating top-left buttons (Base UI `Popover`): Settings (params, printed look, layer height) and Export (STL / STEP) |
 | `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (flat-shaded + edge lines; selection-tint and printed-look shader patches), `CameraRig` (eased camera flights via a shared goal ref), `ResizeHandles3D` (3D grid resize: top view + shadow preview, commit on release), `MappedControls` (view controls) |
 | `src/lib/grid.ts` | Pure grid model: `merges: Region[]` (only >1-cell merges stored; uncovered cells are implicit 1×1). `expandSelection` grows a rect over touched merges until stable — spreadsheet semantics |
 | `src/lib/protocol.ts` | Shared types (`TraySpec`, `MeshData`, worker messages) + shared mm constants (incl. `R_OUT`, used by both the worker and the printed-look shader) + `traySizeMm()` |
@@ -66,7 +67,7 @@ cols/rows/magnets), degraded preview during interaction.
 ## 3D view conventions (Viewer.tsx)
 
 - **Corner-anchored world:** the tray's top-left cell corner is pinned to the origin;
-  columns grow +x, rows grow +z (row 0 at z 0..42, matching the 2D editor). Resizing
+  columns grow +x, rows grow +z (row 0 at z 0..42, screen-down in the top view). Resizing
   therefore never shifts existing geometry, and cell boundaries align with the ground
   grid's 42mm sections. `TrayMesh` derives its y-offset from the **mesh's own bounds**
   (not the grid props) so the stale mesh stays put while the worker rebuilds — don't
@@ -99,12 +100,11 @@ cols/rows/magnets), degraded preview during interaction.
   initializer and OrbitControls gets its target imperatively (not as a prop) — a
   fresh object/array identity on re-render re-applies the prop and teleports the
   camera / snaps the target mid-flight.
-- A grid shrink from the 3D handles can invalidate GridEditor's live selection; it
+- A grid shrink from the 3D handles can invalidate the live cell selection; Viewer
   derives a `sel` guard instead of clearing state (no setState-in-effect).
 - **3D cell selection (`CellSelector`):** left-drag on the tray selects cells with the
-  2D editor's spreadsheet semantics — the shared helpers (`regionAt`, `boundingRect`,
-  `expandSelection`, `canFuseSelection`, `canSplitSelection`) live in `grid.ts`, used by
-  both editors. Only active while the view mapping leaves the left button free
+  spreadsheet semantics — the pure helpers (`regionAt`, `boundingRect`,
+  `expandSelection`, `canFuseSelection`, `canSplitSelection`) live in `grid.ts`. Only active while the view mapping leaves the left button free
   (`buttons.left === "none"`). Picking raycasts the **visible tray mesh** first (via
   `pickRef` on `TrayMesh`), falling back to the ground plane — so a click on a tall wall
   selects the cell the cursor is on, not the occluded one behind it. An invisible
@@ -113,7 +113,7 @@ cols/rows/magnets), degraded preview during interaction.
   wrapper div anchored above the cursor (clamped to the canvas, `popup-in` keyframes in
   globals.css). Fuse, split, Escape, empty-ground clicks, and a click on an already selected
   cell all clear the selection and popup (a press inside the selection only becomes a
-  new drag once the pointer leaves that cell). Viewer guards its selection against shrinks like GridEditor does.
+  new drag once the pointer leaves that cell).
 - **Selection visual = interior tint, not an overlay:** `TrayMesh` recolors the tray's
   own fragments via `onBeforeCompile` uniforms — inside the selection's world box, minus
   horizontal top-rim faces (`n.y > 0.9` above `topZ − 0.8`) and outer-shell fragments
