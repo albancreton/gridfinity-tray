@@ -149,8 +149,6 @@ function groundPoint(ray: THREE.Ray, out: THREE.Vector3): THREE.Vector3 | null {
 // --- 3D resize handles -------------------------------------------------------
 
 const HANDLE_GAP = 12; // mm from tray edge to icon center
-// The corner icon sits on the diagonal at the same distance from the tray as the edge ones.
-const HANDLE_GAP_DIAG = HANDLE_GAP / Math.SQRT2;
 const HANDLE_ICON = 16; // icon height in mm (the SVG's 24-unit viewBox maps to this)
 const HANDLE_HIT_LONG = 36; // hit box extent along the edge the handle sits on
 const HANDLE_HIT_SHORT = 20;
@@ -161,10 +159,10 @@ const HANDLE_REST_Y = 0.25; // just above the ground grid
 const HANDLE_HOVER_Y = 3; // mm the icon lifts while hovered or dragged
 const RESIZE_ICON_URL: string = resizeIcon.src;
 
-type Axis = "x" | "y" | "xy";
+type Axis = "x" | "y";
 
 /** Spin about y so the double chevron points along the axis it resizes. */
-const AXIS_SPIN: Record<Axis, number> = { x: Math.PI / 2, y: 0, xy: Math.PI / 4 };
+const AXIS_SPIN: Record<Axis, number> = { x: Math.PI / 2, y: 0 };
 
 interface ShadowState {
   cols: number;
@@ -197,8 +195,8 @@ function useResizeIconGeometry(): THREE.BufferGeometry {
 
 /**
  * One handle's chevrons. At rest: half size, half opacity, on the ground. Hover:
- * full opacity and a small lift. In use (dragging): full size, and the other two
- * handles fade out (`dimmed`). All ease over ~100ms
+ * full opacity and a small lift. In use (dragging): full size, and the other
+ * handle fades out (`dimmed`). All ease over ~100ms
  * in the frame loop; the initial props are stable primitives so re-renders never
  * snap them.
  */
@@ -262,13 +260,13 @@ function Handle({
   z: number;
   axis: Axis;
   active: boolean;
-  /** Another handle is in use: fade out and stop taking the pointer. */
+  /** The other handle is in use: fade out and stop taking the pointer. */
   dimmed: boolean;
   onDown: (axis: Axis, e: ThreeEvent<PointerEvent>) => void;
 }) {
   const [hover, setHover] = useState(false);
-  const hx = axis === "y" ? HANDLE_HIT_LONG : axis === "x" ? HANDLE_HIT_SHORT : 24;
-  const hz = axis === "x" ? HANDLE_HIT_LONG : axis === "y" ? HANDLE_HIT_SHORT : 24;
+  const hx = axis === "y" ? HANDLE_HIT_LONG : HANDLE_HIT_SHORT;
+  const hz = axis === "x" ? HANDLE_HIT_LONG : HANDLE_HIT_SHORT;
   return (
     <group position={[x, 0, z]}>
       {/* oversized invisible hit box so the flat icon is easy to grab */}
@@ -330,7 +328,7 @@ function SizeShadow({ cols, rows }: { cols: number; rows: number }) {
 }
 
 /**
- * The three grid-resize handles (columns / rows / both). Dragging one previews
+ * The two grid-resize handles (columns on the right edge, rows on the bottom). Dragging one previews
  * the new size as a ground shadow from whatever view the user is in — the
  * camera never moves — and releasing commits it in one rebuild.
  */
@@ -382,8 +380,8 @@ function ResizeHandles3D({
       if (!groundPoint(raycaster.ray, hit)) return;
       // Absolute mapping: the dragged edge snaps to the grid line nearest the
       // pointer's point on the ground plane, whatever the viewing angle.
-      const c = axis === "y" ? startCols : clampUnits(Math.round(hit.x / PITCH));
-      const r = axis === "x" ? startRows : clampUnits(Math.round(hit.z / PITCH));
+      const c = axis === "x" ? clampUnits(Math.round(hit.x / PITCH)) : startCols;
+      const r = axis === "y" ? clampUnits(Math.round(hit.z / PITCH)) : startRows;
       preview.cols = c;
       preview.rows = r;
       setShadow((s) =>
@@ -448,14 +446,6 @@ function ResizeHandles3D({
         axis="y"
         active={visible?.axis === "y"}
         dimmed={visible !== null && visible.axis !== "y"}
-        onDown={beginDrag}
-      />
-      <Handle
-        x={pw + HANDLE_GAP_DIAG}
-        z={pd + HANDLE_GAP_DIAG}
-        axis="xy"
-        active={visible?.axis === "xy"}
-        dimmed={visible !== null && visible.axis !== "xy"}
         onDown={beginDrag}
       />
     </group>

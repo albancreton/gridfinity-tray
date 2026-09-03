@@ -80,16 +80,15 @@ cols/rows/magnets), degraded preview during interaction.
   the Viewer only once `hydrated`, so that one-time pose frames the *restored* design.
   If a fit-view button is ever wanted, the eased orbit-angle-space flight rig
   (`CameraRig`) is in git history just before that change.
-- **Handle icons:** the three resize handles are `assets/resize.svg` (a vertical double
+- **Handle icons:** the two resize handles (columns / rows) are `assets/resize.svg` (a vertical double
   chevron) drawn flat on the ground: Next's static import gives the URL, `SVGLoader`
   turns it into one merged `ShapeGeometry` (`useResizeIconGeometry`), rotated so
   SVG-down maps to +z (screen-down when seen from above) and spun per axis (`AXIS_SPIN`).
   The icon is not pickable; an oversized invisible box above it takes the pointer. States:
   rest = half size + half opacity on the ground, hover = full opacity + 3mm lift,
-  dragging = full size while the other two fade out (and stop taking the pointer); all ease
+  dragging = full size while the other fades out (and stops taking the pointer); all ease
   in `useFrame` (the initial scale/opacity props are stable primitives, so re-renders
-  don't snap them). The corner icon sits at `HANDLE_GAP / √2` per axis so it is as far
-  from the tray as the edge ones. No cursor change on hover — by request.
+  don't snap them). No cursor change on hover — by request.
 - **Handle drag flow:** pointerdown disables controls (a mapping with orbit/pan on the
   left button must not also move the view); moves use window-level listeners and
   **absolute** snapping — the pointer is raycast onto the ground plane and the dragged
