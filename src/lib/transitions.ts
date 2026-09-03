@@ -1,81 +1,51 @@
-// How one tray layout turns into the next, for the viewer's animations: which
-// cells appear or vanish after a resize (and in what order), which divider walls
-// a fuse removes or a split adds. Pure — the viewer only plays these back.
+// How one tray layout turns into the next, for the viewer's animations. Both
+// trays come partitioned into parts (lib/trayParts); the diff is by part key,
+// after mapping the old keys into the new world. Parts only the new tray has
+// enter, parts only the old tray had leave; each side is grouped into entities
+// — a cell with everything that belongs to it, or a lone wall segment — and
+// given a preset from lib/animPresets. Pure: the viewer only plays this back.
 
-import { CLEAR, PITCH, type TrayParams } from "./protocol";
+import { PITCH, type TrayParams } from "./protocol";
 import { type Frame, type GridState, regionAt } from "./grid";
-import { levels, pocketRect } from "./layout";
-import type { TrayGeometry } from "./trayMesher";
+import type { PartKind, PartitionedTray, TrayPart } from "./trayParts";
+import { PRESET_MS, slowFactor, type PresetName } from "./animPresets";
 
-// Deliberately unhurried: the user wants to watch these happen. Below ~450ms a
-// reveal reads as a flash; 520ms still felt quick.
-/** One cell printing in (or un-printing). */
-export const CELL_REVEAL_MS = 1300;
-/** Between consecutive cells; shrinks when many cells move at once. */
+/** Between consecutive cells of a resize wave; shrinks when many cells move at once. */
 export const CELL_STAGGER_MS = 180;
-export const PART_EXPLODE_MS = 2000;
-export const PART_LAND_MS = 1000;
-export const PART_STAGGER_MS = 120;
+/** Between consecutive walls landing after a split. */
+export const LAND_STAGGER_MS = 120;
 
-/**
- * Per-cell reveal schedule for one tray mesh: a delay in ms per cell (row-major
- * in that mesh's own grid), negative for cells that don't animate. "in": animated
- * cells print from the bed up, the rest are shown. "out": animated cells
- * un-print, the rest are hidden.
- */
-export interface CellAnim {
-  start: number;
-  duration: number;
-  delays: Float32Array;
-  mode: "in" | "out";
-}
-
-/** Axis-aligned box (mm, world frame) standing in for a divider wall segment. */
-export interface PartBox {
-  key: string;
-  x0: number;
-  x1: number;
-  z0: number;
-  z1: number;
-  y0: number;
-  y1: number;
-}
-
-export interface PartGroup {
-  boxes: PartBox[];
-  /** explode: burst up and away, fading. land: drop in from above, one after another. */
-  mode: "explode" | "land";
-  /** Plan center the explosion radiates from. */
-  center: [number, number];
-  /** Per part: total flight (explode) or fall time (land), ms. */
-  duration: number;
-  /** Between consecutive parts (land), ms. */
-  stagger: number;
-}
-
-/** World-space box above `minY` whose contents the main mesh hides (a split's new dividers until their stand-ins land). */
-export interface HideBox {
-  min: [number, number];
-  max: [number, number];
-  minY: number;
-}
-
-export interface Snapshot {
-  grid: GridState;
-  geometry: TrayGeometry;
-  params: TrayParams;
+export interface EntityAnim {
+  id: string;
+  /** Part keys merged into the entity's mesh. */
+  keys: string[];
+  preset: PresetName;
+  /** ms after the transition start. */
+  delay: number;
+  /** Unit plan direction away from the change's center (zero when there is none). */
+  dir: [number, number];
+  /** Stable number in [0, 1) for deterministic variation. */
+  seed: number;
 }
 
 export interface Transition {
   start: number;
-  /** When everything has settled; the viewer drops the transition then. */
-  end: number;
-  /** Cells of the new tray printing in. */
-  appear: CellAnim | null;
-  /** The previous geometry, placed in the new world, with its removed cells un-printing. */
-  retire: { geometry: TrayGeometry; grid: GridState; offset: [number, number, number]; anim: CellAnim } | null;
-  parts: PartGroup[];
-  hide: HideBox | null;
+  /** ms from the moment playback starts (the second frame after the scene is up) until everything has settled. */
+  duration: number;
+  /** Entities of the new tray; the static mesh omits their parts while they play. */
+  enter: EntityAnim[];
+  /** Entities of the old tray, rendered from `leaveTray` at `leaveOffset`. */
+  leave: EntityAnim[];
+  leaveTray: PartitionedTray;
+  leaveGrid: GridState;
+  /** Where the old tray sits in the new world (a left/top resize shifts the origin). */
+  leaveOffset: [number, number, number];
+}
+
+export interface Snapshot {
+  grid: GridState;
+  geometry: PartitionedTray;
+  params: TrayParams;
 }
 
 function regionKey(g: GridState, r: number, c: number): string {
@@ -92,62 +62,61 @@ function sameGrid(a: GridState, b: GridState): boolean {
 }
 
 /**
- * Every interior divider of a grid as a box, one per cell edge that separates two
- * compartments. Ends reach into the outer wall at the tray edge and into the
- * junction post where a perpendicular divider meets, and butt flush against a
- * continuing one — so a run of boxes reads as one wall and hides inside solids.
+ * The key an old part would have in the new tray, or null when the feature it
+ * names no longer exists there (an outer wall that turned into a divider, a
+ * corner that moved). Cells shift by the frame's origin; edge features survive
+ * only if their edge is still the tray's edge.
  */
-export function dividerBoxes(grid: GridState, params: TrayParams): PartBox[] {
-  const { cols, rows } = grid;
-  const lv = levels(params);
-  const half = params.wall / 2;
-  const y0 = lv.floorZ - 0.3;
-  const y1 = lv.dividerTop;
-  const keys: string[][] = [];
-  for (let r = 0; r < rows; r++) {
-    keys.push([]);
-    for (let c = 0; c < cols; c++) keys[r].push(regionKey(grid, r, c));
-  }
-  // Divider between (r, c) and (r, c+1) / between (r, c) and (r+1, c).
-  const vert = (r: number, c: number) =>
-    r >= 0 && r < rows && c >= 0 && c < cols - 1 && keys[r][c] !== keys[r][c + 1];
-  const horiz = (r: number, c: number) =>
-    r >= 0 && r < rows - 1 && c >= 0 && c < cols && keys[r][c] !== keys[r + 1][c];
-  const out: PartBox[] = [];
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols - 1; c++) {
-      if (!vert(r, c)) continue;
-      const x = PITCH * (c + 1);
-      const z0 = r === 0 ? CLEAR + half : vert(r - 1, c) ? PITCH * r : PITCH * r - half;
-      const z1 =
-        r === rows - 1 ? PITCH * rows - CLEAR - half : vert(r + 1, c) ? PITCH * (r + 1) : PITCH * (r + 1) + half;
-      out.push({ key: `v${r}:${c}`, x0: x - half, x1: x + half, z0, z1, y0, y1 });
+function remapKey(key: string, f: Frame, og: GridState): string | null {
+  const [kind, ...rest] = key.split(":");
+  const dc = -f.c0, dr = -f.r0;
+  switch (kind) {
+    case "foot":
+    case "cell": {
+      const [c, r] = rest[0].split(",").map(Number);
+      return `${kind}:${c + dc},${r + dr}`;
+    }
+    case "div":
+      return `div:${rest[0]}:${Number(rest[1]) + dr}:${Number(rest[2]) + dc}`;
+    case "post":
+      return `post:${Number(rest[0]) + dr}:${Number(rest[1]) + dc}`;
+    case "wall": {
+      const i = Number(rest[1]);
+      switch (rest[0]) {
+        case "top":
+          return f.r0 === 0 ? `wall:top:${i + dc}` : null;
+        case "bottom":
+          return f.r1 === og.rows ? `wall:bottom:${i + dc}` : null;
+        case "left":
+          return f.c0 === 0 ? `wall:left:${i + dr}` : null;
+        default:
+          return f.c1 === og.cols ? `wall:right:${i + dr}` : null;
+      }
+    }
+    default: {
+      const t = rest[0][0] === "t", l = rest[0][1] === "l";
+      const rowOk = t ? f.r0 === 0 : f.r1 === og.rows;
+      const colOk = l ? f.c0 === 0 : f.c1 === og.cols;
+      return rowOk && colOk ? key : null;
     }
   }
-  for (let r = 0; r < rows - 1; r++) {
-    for (let c = 0; c < cols; c++) {
-      if (!horiz(r, c)) continue;
-      const z = PITCH * (r + 1);
-      const x0 = c === 0 ? CLEAR + half : horiz(r, c - 1) ? PITCH * c : PITCH * c - half;
-      const x1 =
-        c === cols - 1 ? PITCH * cols - CLEAR - half : horiz(r, c + 1) ? PITCH * (c + 1) : PITCH * (c + 1) + half;
-      out.push({ key: `h${r}:${c}`, x0, x1, z0: z - half, z1: z + half, y0, y1 });
-    }
-  }
-  return out;
 }
 
-function centroid(boxes: PartBox[]): [number, number] {
-  let x = 0, z = 0;
-  for (const b of boxes) {
-    x += (b.x0 + b.x1) / 2;
-    z += (b.z0 + b.z1) / 2;
+/** Plan center of a part (bounding box middle of its vertices). */
+function partCenter(p: TrayPart): [number, number] {
+  let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  for (let i = 0; i < p.positions.length; i += 3) {
+    const x = p.positions[i], z = p.positions[i + 2];
+    if (x < x0) x0 = x;
+    if (x > x1) x1 = x;
+    if (z < z0) z0 = z;
+    if (z > z1) z1 = z;
   }
-  return [x / boxes.length, z / boxes.length];
+  return [(x0 + x1) / 2, (z0 + z1) / 2];
 }
 
 interface CellOrder {
-  index: number;
+  key: string;
   /** Chebyshev distance to the footprint the cell joins or leaves (≥ 1). */
   dist: number;
   /** Position along the moving edge, for a diagonal ripple. */
@@ -155,120 +124,141 @@ interface CellOrder {
 }
 
 /** Delays for a wave of cells: nearest-first when growing, farthest-first when shrinking. */
-function schedule(
-  cells: CellOrder[],
-  count: number,
-  reverse: boolean,
-  scale: number,
-): { delays: Float32Array; last: number } {
-  const delays = new Float32Array(count).fill(-1);
-  if (cells.length === 0) return { delays, last: 0 };
+function schedule(cells: CellOrder[], reverse: boolean, scale: number): Map<string, number> {
+  const delays = new Map<string, number>();
+  if (cells.length === 0) return delays;
   const step = Math.min(CELL_STAGGER_MS, 2400 / cells.length) * scale;
   const maxD = Math.max(...cells.map((c) => c.dist));
-  let last = 0;
   for (const c of cells) {
-    const d = (reverse ? maxD - c.dist : c.dist - 1) + 0.35 * c.along;
-    delays[c.index] = step * d;
-    last = Math.max(last, delays[c.index]);
+    delays.set(c.key, step * ((reverse ? maxD - c.dist : c.dist - 1) + 0.35 * c.along));
   }
-  return { delays, last };
+  return delays;
+}
+
+const hash = (i: number) => {
+  const s = Math.sin(i * 12.9898 + 78.233) * 43758.5453;
+  return s - Math.floor(s);
+};
+
+/** Groups parts into entities: one per animating cell (claiming every part that touches it), then one per leftover part. */
+function entities(
+  parts: TrayPart[],
+  cellDelays: Map<string, number>,
+  cellPreset: PresetName,
+  lonePreset: (kind: PartKind) => PresetName,
+  loneStagger: number,
+  idPrefix: string,
+): EntityAnim[] {
+  const claimed = new Set<string>();
+  const out: EntityAnim[] = [];
+  for (const [cell, delay] of cellDelays) {
+    const [c, r] = cell.split(",").map(Number);
+    const keys = parts
+      .filter((p) => !claimed.has(p.key) && p.cells.some(([pc, pr]) => pc === c && pr === r))
+      .map((p) => p.key);
+    keys.forEach((k) => claimed.add(k));
+    if (keys.length) out.push({ id: `${idPrefix}cell:${cell}`, keys, preset: cellPreset, delay, dir: [0, 0], seed: 0 });
+  }
+  let landed = 0;
+  for (const p of parts) {
+    if (claimed.has(p.key)) continue;
+    const preset = lonePreset(p.kind);
+    out.push({ id: `${idPrefix}${p.key}`, keys: [p.key], preset, delay: preset === "land" ? landed++ * loneStagger : 0, dir: [0, 0], seed: 0 });
+  }
+  return out;
 }
 
 /**
  * The transition from `prev` to `next`, or null when nothing animates. `frame`
- * is the resize that produced `next` (in `prev`'s grid units), needed to know
- * where the old cells sit in the new world; without it a same-size change is a
- * fuse/split and its divider walls become rigid stand-ins.
+ * is the resize that produced `next` (in `prev`'s grid units) and says where the
+ * old cells sit in the new world; without it the change is a fuse/split.
  */
 export function makeTransition(prev: Snapshot, next: Snapshot, frame: Frame | null, now: number): Transition | null {
   if (prev.grid === next.grid || sameGrid(prev.grid, next.grid)) return null;
-  const t: Transition = { start: now, end: now, appear: null, retire: null, parts: [], hide: null };
-  const og = prev.grid;
-  const ng = next.grid;
-  // Dev hook: `window.__animSlow = 6` stretches every transition 6× for inspection.
-  const slow =
-    typeof window !== "undefined" && process.env.NODE_ENV === "development"
-      ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        Number((window as any).__animSlow) || 1
-      : 1;
-  const CELL_REVEAL = CELL_REVEAL_MS * slow;
-  const PART_EXPLODE = PART_EXPLODE_MS * slow;
-  const PART_LAND = PART_LAND_MS * slow;
-  const PART_STAGGER = PART_STAGGER_MS * slow;
+  const slow = slowFactor();
+  const og = prev.grid, ng = next.grid;
+  const f: Frame = frame ?? { c0: 0, r0: 0, c1: og.cols, r1: og.rows };
 
+  // Diff by key: old parts whose remapped key exists in the new tray survive.
+  const newByKey = new Map(next.geometry.parts.map((p) => [p.key, p]));
+  const survived = new Set<string>();
+  const leavingParts: TrayPart[] = [];
+  for (const p of prev.geometry.parts) {
+    const k = remapKey(p.key, f, og);
+    if (k && newByKey.has(k)) survived.add(k);
+    else leavingParts.push(p);
+  }
+  const enteringParts = next.geometry.parts.filter((p) => !survived.has(p.key));
+  if (enteringParts.length === 0 && leavingParts.length === 0) return null;
+
+  // Cells joining and leaving (a resize); fuse/split have none.
+  const appearing: CellOrder[] = [];
+  const leaving: CellOrder[] = [];
   if (frame) {
-    // New cell (c, r) was old cell (c + frame.c0, r + frame.r0).
-    const appearing: CellOrder[] = [];
     for (let r = 0; r < ng.rows; r++) {
       for (let c = 0; c < ng.cols; c++) {
-        const oc = c + frame.c0, or = r + frame.r0;
+        const oc = c + f.c0, or = r + f.r0;
         const dx = oc < 0 ? -oc : oc >= og.cols ? oc - og.cols + 1 : 0;
         const dz = or < 0 ? -or : or >= og.rows ? or - og.rows + 1 : 0;
-        if (dx === 0 && dz === 0) continue;
-        appearing.push({ index: r * ng.cols + c, dist: Math.max(dx, dz), along: dx > 0 ? r : c });
+        if (dx || dz) appearing.push({ key: `${c},${r}`, dist: Math.max(dx, dz), along: dx > 0 ? r : c });
       }
     }
-    const leaving: CellOrder[] = [];
     for (let r = 0; r < og.rows; r++) {
       for (let c = 0; c < og.cols; c++) {
-        const dx = c < frame.c0 ? frame.c0 - c : c >= frame.c1 ? c - frame.c1 + 1 : 0;
-        const dz = r < frame.r0 ? frame.r0 - r : r >= frame.r1 ? r - frame.r1 + 1 : 0;
-        if (dx === 0 && dz === 0) continue;
-        leaving.push({ index: r * og.cols + c, dist: Math.max(dx, dz), along: dx > 0 ? r : c });
+        const dx = c < f.c0 ? f.c0 - c : c >= f.c1 ? c - f.c1 + 1 : 0;
+        const dz = r < f.r0 ? f.r0 - r : r >= f.r1 ? r - f.r1 + 1 : 0;
+        if (dx || dz) leaving.push({ key: `${c},${r}`, dist: Math.max(dx, dz), along: dx > 0 ? r : c });
       }
-    }
-    if (appearing.length > 0) {
-      const s = schedule(appearing, ng.cols * ng.rows, false, slow);
-      t.appear = { start: now, duration: CELL_REVEAL, delays: s.delays, mode: "in" };
-      t.end = Math.max(t.end, now + s.last + CELL_REVEAL);
-    }
-    if (leaving.length > 0) {
-      const s = schedule(leaving, og.cols * og.rows, true, slow);
-      t.retire = {
-        geometry: prev.geometry,
-        grid: og,
-        offset: [-frame.c0 * PITCH, 0, -frame.r0 * PITCH],
-        anim: { start: now, duration: CELL_REVEAL, delays: s.delays, mode: "out" },
-      };
-      t.end = Math.max(t.end, now + s.last + CELL_REVEAL);
-    }
-  } else if (og.cols === ng.cols && og.rows === ng.rows) {
-    const before = dividerBoxes(og, next.params);
-    const after = dividerBoxes(ng, next.params);
-    const beforeKeys = new Set(before.map((b) => b.key));
-    const afterKeys = new Set(after.map((b) => b.key));
-    const removed = before.filter((b) => !afterKeys.has(b.key));
-    const added = after.filter((b) => !beforeKeys.has(b.key));
-    if (removed.length > 0) {
-      t.parts.push({ boxes: removed, mode: "explode", center: centroid(removed), duration: PART_EXPLODE, stagger: 0 });
-      t.end = Math.max(t.end, now + PART_EXPLODE);
-    }
-    if (added.length > 0) {
-      t.parts.push({ boxes: added, mode: "land", center: centroid(added), duration: PART_LAND, stagger: PART_STAGGER });
-      t.end = Math.max(t.end, now + PART_LAND + PART_STAGGER * (added.length - 1));
-      // Hide the real new dividers until the stand-ins have landed: everything
-      // above the floor inside the split compartments (their walls excluded).
-      const lv = levels(next.params);
-      const box = { min: [Infinity, Infinity] as [number, number], max: [-Infinity, -Infinity] as [number, number] };
-      const seen = new Set<string>();
-      for (let r = 0; r < og.rows; r++) {
-        for (let c = 0; c < og.cols; c++) {
-          const k = regionKey(og, r, c);
-          if (k === regionKey(ng, r, c) || seen.has(k)) continue;
-          seen.add(k);
-          const rr = pocketRect({ cols: og.cols, rows: og.rows, wall: next.params.wall }, regionAt(og, r, c));
-          if (!rr) continue;
-          box.min[0] = Math.min(box.min[0], rr.x0 + 0.05);
-          box.min[1] = Math.min(box.min[1], rr.z0 + 0.05);
-          box.max[0] = Math.max(box.max[0], rr.x1 - 0.05);
-          box.max[1] = Math.max(box.max[1], rr.z1 - 0.05);
-        }
-      }
-      if (seen.size > 0) t.hide = { min: box.min, max: box.max, minY: lv.floorZ + 0.05 };
     }
   }
 
-  if (!t.appear && !t.retire && t.parts.length === 0) return null;
-  t.end += 30;
-  return t;
+  const enter = entities(
+    enteringParts,
+    schedule(appearing, false, slow),
+    "cellIn",
+    (kind) => (kind === "divider" || kind === "post" ? "land" : "fadeIn"),
+    LAND_STAGGER_MS * slow,
+    "",
+  );
+  const leave = entities(
+    leavingParts,
+    schedule(leaving, true, slow),
+    "cellOut",
+    (kind) => (kind === "divider" || kind === "post" ? "explode" : "fadeOut"),
+    0,
+    "old:",
+  );
+
+  // Directions radiate from the center of everything that changed.
+  const leaveOffset: [number, number, number] = [-f.c0 * PITCH, 0, -f.r0 * PITCH];
+  const oldByKey = new Map(prev.geometry.parts.map((p) => [p.key, p]));
+  const centerOf = (e: EntityAnim, byKey: Map<string, TrayPart>, off: [number, number]): [number, number] => {
+    let x = 0, z = 0, n = 0;
+    for (const k of e.keys) {
+      const p = byKey.get(k);
+      if (!p) continue;
+      const [cx, cz] = partCenter(p);
+      x += cx + off[0];
+      z += cz + off[1];
+      n++;
+    }
+    return n ? [x / n, z / n] : [0, 0];
+  };
+  const centers = [
+    ...enter.map((e) => centerOf(e, newByKey, [0, 0])),
+    ...leave.map((e) => centerOf(e, oldByKey, [leaveOffset[0], leaveOffset[2]])),
+  ];
+  const cx = centers.reduce((s, c) => s + c[0], 0) / centers.length;
+  const cz = centers.reduce((s, c) => s + c[1], 0) / centers.length;
+  [...enter, ...leave].forEach((e, i) => {
+    const [ex, ez] = centers[i];
+    const len = Math.hypot(ex - cx, ez - cz);
+    const a = hash(i) * Math.PI * 2;
+    e.dir = len > 1e-6 ? [(ex - cx) / len, (ez - cz) / len] : [Math.cos(a), Math.sin(a)];
+    e.seed = hash(i + 1);
+  });
+
+  let duration = 0;
+  for (const e of [...enter, ...leave]) duration = Math.max(duration, e.delay + PRESET_MS[e.preset] * slow);
+  return { start: now, duration: duration + 30, enter, leave, leaveTray: prev.geometry, leaveGrid: prev.grid, leaveOffset };
 }

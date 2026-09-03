@@ -6,7 +6,7 @@ import Toolbar from "@/components/Toolbar";
 import { GridState, allRegions, initialGrid, reframe } from "@/lib/grid";
 import { requestExport, downloadBlob } from "@/lib/cadClient";
 import { traySizeMm, type TrayParams, type TraySpec } from "@/lib/protocol";
-import { buildTrayGeometry } from "@/lib/trayMesher";
+import { buildTrayParts } from "@/lib/trayParts";
 import { DEFAULT_VIEW, type ViewSettings } from "@/lib/viewSettings";
 
 const Viewer = dynamic(() => import("@/components/Viewer"), { ssr: false });
@@ -71,9 +71,10 @@ export default function Home() {
     () => ({ cols: grid.cols, rows: grid.rows, regions: allRegions(grid), ...params }),
     [grid, params],
   );
-  // The preview is meshed synchronously from the layout — every change shows on
-  // the next frame. The CAD kernel (a worker, loaded on first use) only builds exports.
-  const geometry = useMemo(() => buildTrayGeometry(spec), [spec]);
+  // The preview is meshed synchronously from the layout and partitioned into
+  // animatable parts — every change shows on the next frame. The CAD kernel (a
+  // worker, loaded on first use) only builds exports.
+  const geometry = useMemo(() => buildTrayParts(spec), [spec]);
   const size = traySizeMm(spec);
   const fmt = (v: number) => String(Number(v.toFixed(2)));
 

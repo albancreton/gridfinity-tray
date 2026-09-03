@@ -156,7 +156,7 @@ function bboxOverlap(a: Outline["bbox"], b: Outline["bbox"]): boolean {
 // --- Triangle sink -------------------------------------------------------
 
 /** Growable Float32Array — a 12×12 tray is ~100k triangles, too many for number[] pushes. */
-class Buf {
+export class Buf {
   data = new Float32Array(1 << 15);
   len = 0;
 
@@ -474,13 +474,25 @@ export function buildTrayGeometry(spec: TraySpec): TrayGeometry {
     return found.sort((u, v) => u.t - v.t).map((f) => f.p);
   };
 
-  /** Emit one clipped top-surface polygon of band `k`, plus the walls hanging off its edges. */
-  const emitTopPolygon = (poly: Polygon, k: number) => {
+  /**
+   * Emit one clipped top-surface polygon of band `k`, plus the walls hanging off
+   * its edges. `fan` triangulates from the first vertex (for hole-free polygons
+   * that are convex or star-shaped from it) instead of running earcut.
+   */
+  const emitTopPolygon = (poly: Polygon, k: number, fan = false) => {
     const band = bands[k];
     const next = bands[k + 1];
     const hOf = (p: Pair) => bandHeight(band, p);
     const norm = normalizePolygon(poly);
-    fillPolygon(norm, hOf, UP, out);
+    if (fan) {
+      const ring = stripClose(norm[0]);
+      const p0 = lift(ring[0], hOf(ring[0]));
+      for (let i = 1; i < ring.length - 1; i++) {
+        out.tri(p0, lift(ring[i], hOf(ring[i])), lift(ring[i + 1], hOf(ring[i + 1])), UP);
+      }
+    } else {
+      fillPolygon(norm, hOf, UP, out);
+    }
     const iso = isoRings[k];
     const stepBelow = next && next.insB === next.insA ? next : null;
     const handleEdge = (a: Pair, b: Pair) => {
@@ -537,17 +549,57 @@ export function buildTrayGeometry(spec: TraySpec): TrayGeometry {
     const inner = isoRings[k];
     if (inner === null) {
       // Flat center: everything inside the last ring (or the whole outline),
-      // minus pockets. Pockets wholly inside are plain holes; only the ones
-      // crossing the ring need the clipper.
+      // minus pockets — built per cell (the cell square, clipped to the ring
+      // where it reaches it, minus the cell's pocket) so no triangle spans
+      // cells: earcut on one polygon with a hundred holes makes tray-long
+      // slivers, which render worse and shatter into dozens of pieces when the
+      // part partition (lib/trayParts) cuts along the cell lines.
       const ringO = k === 0 ? outerO : isoRings[k - 1]!;
       const ringRR = k === 0 ? outer : insetRRect(outer, bands[k - 1].insB!);
-      const holes: Polygon[] = [];
-      const crossing: Polygon[] = [];
-      for (const pk of pockets) {
-        (pk.o.pts.every((p) => sdRRect(p, ringRR) < -EPS) ? holes : crossing).push(pk.poly);
+      const W = PITCH * cols, D = PITCH * rows;
+      const outsideRing: Polygon = [
+        [[-1, -1], [W + 1, -1], [W + 1, D + 1], [-1, D + 1], [-1, -1]],
+        [...toRing(ringO)].reverse(),
+      ];
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const cx0 = PITCH * c, cz0 = PITCH * r, cx1 = cx0 + PITCH, cz1 = cz0 + PITCH;
+          const corners: Pair[] = [[cx0, cz0], [cx1, cz0], [cx1, cz1], [cx0, cz1]];
+          const pi = cellPocket[r * cols + c];
+          const pk = pi >= 0 ? pockets[pi] : null;
+          const insideRing = corners.every((p) => sdRRect(p, ringRR) < -EPS);
+          if (pk && insideRing) {
+            // Interior cell: the square minus its pocket, laid out by hand as a
+            // strip along each walled side plus a cove at each walled corner.
+            // Vertices sit at the pocket's corner and tangent points so the
+            // strips' inner edges are exactly the pocket sides (→ walls) and
+            // the coves share their arc with the pocket floor.
+            const { x0, x1, z0, z1, r: rc } = pk.rr;
+            const L = x0 > cx0 + EPS, R = x1 < cx1 - EPS, T = z0 > cz0 + EPS, B = z1 < cz1 - EPS;
+            if (!L && !R && !T && !B) continue; // deep inside a merged compartment
+            const rings: Ring[] = [];
+            const xa = L ? x0 : cx0, xb = R ? x1 : cx1;
+            if (L) rings.push([[cx0, cz0], [x0, cz0], ...(T ? [[x0, z0], [x0, z0 + rc]] as Pair[] : []), ...(B ? [[x0, z1 - rc], [x0, z1]] as Pair[] : []), [x0, cz1], [cx0, cz1], [cx0, cz0]]);
+            if (R) rings.push([[x1, cz0], [cx1, cz0], [cx1, cz1], [x1, cz1], ...(B ? [[x1, z1], [x1, z1 - rc]] as Pair[] : []), ...(T ? [[x1, z0 + rc], [x1, z0]] as Pair[] : []), [x1, cz0]]);
+            if (T) rings.push([[xa, cz0], [xb, cz0], [xb, z0], ...(R ? [[x1 - rc, z0]] as Pair[] : []), ...(L ? [[x0 + rc, z0]] as Pair[] : []), [xa, z0], [xa, cz0]]);
+            if (B) rings.push([[xa, z1], ...(L ? [[x0 + rc, z1]] as Pair[] : []), ...(R ? [[x1 - rc, z1]] as Pair[] : []), [xb, z1], [xb, cz1], [xa, cz1], [xa, z1]]);
+            const arc = (ci: number) => pk.o.pts.slice(pk.o.tangents[2 * ci], pk.o.tangents[2 * ci + 1] + 1);
+            if (R && T) rings.push([[x1, z0], ...arc(0), [x1, z0]]);
+            if (R && B) rings.push([[x1, z1], ...arc(1), [x1, z1]]);
+            if (L && B) rings.push([[x0, z1], ...arc(2), [x0, z1]]);
+            if (L && T) rings.push([[x0, z0], ...arc(3), [x0, z0]]);
+            for (const ring of rings) emitTopPolygon([ring], k, true);
+            continue;
+          }
+          const clips: Polygon[] = [];
+          if (pk) {
+            if (corners.every((p) => sdRRect(p, pk.rr) <= EPS)) continue;
+            clips.push(pk.poly);
+          }
+          if (!insideRing) clips.push(outsideRing);
+          for (const poly of difference([[...corners, corners[0]]], clips)) emitTopPolygon(poly, k);
+        }
       }
-      const subject: Polygon = [toRing(ringO), ...holes.map((h) => h[0])];
-      for (const poly of difference(subject, crossing)) emitTopPolygon(poly, k);
       continue;
     }
     // Annulus between two concentric rings, as quads clipped one by one.
