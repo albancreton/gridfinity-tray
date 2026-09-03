@@ -129,14 +129,17 @@ export default function Home() {
 
   return (
     <main className="relative h-dvh bg-neutral-950 text-neutral-200">
-        <Viewer
-          mesh={mesh}
-          grid={grid}
-          params={params}
-          onResize={(c, r) => setGrid((g) => resize(g, c, r))}
-          onGridChange={setGrid}
-          view={view}
-        />
+        {/* Mounted after the restore: the Viewer frames the tray once, at mount. */}
+        {hydrated && (
+          <Viewer
+            mesh={mesh}
+            grid={grid}
+            params={params}
+            onResize={(c, r) => setGrid((g) => resize(g, c, r))}
+            onGridChange={setGrid}
+            view={view}
+          />
+        )}
         <Toolbar
           params={params}
           onChange={setParams}

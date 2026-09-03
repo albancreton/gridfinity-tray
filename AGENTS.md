@@ -36,7 +36,7 @@ react-three-fiber 9 + drei 10 · replicad 1.0 over OpenCASCADE WASM, in a web wo
 |---|---|
 | `src/app/page.tsx` | State owner: `GridState` + `TrayParams` → `TraySpec`; 150ms-debounced, latest-wins mesh requests; plus render-only `ViewSettings`; localStorage persistence (`gridfinity-tray-v1`); export handler; size readout |
 | `src/components/Toolbar.tsx` | Floating top-left buttons (Base UI `Popover`): Settings (params, printed look, layer height) and Export (STL / STEP) |
-| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (flat-shaded + edge lines; selection-tint and printed-look shader patches), `CameraRig` (eased camera flights via a shared goal ref), `ResizeHandles3D` (3D grid resize: top view + shadow preview, commit on release), `MappedControls` (view controls) |
+| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (flat-shaded + edge lines; selection-tint and printed-look shader patches), `ResizeHandles3D` (3D grid resize in place: ground-shadow preview, commit on release), `MappedControls` (view controls; sets the one-time initial orbit target) |
 | `src/lib/grid.ts` | Pure grid model: `merges: Region[]` (only >1-cell merges stored; uncovered cells are implicit 1×1). `expandSelection` grows a rect over touched merges until stable — spreadsheet semantics |
 | `src/lib/protocol.ts` | Shared types (`TraySpec`, `MeshData`, worker messages) + shared mm constants (incl. `R_OUT`, used by both the worker and the printed-look shader) + `traySizeMm()` |
 | `src/lib/viewMapping.ts` | Mouse-button → view-action presets (pure data). Active: `"fusion"` (middle=pan, shift+middle=orbit, wheel=zoom, left/right free) |
@@ -73,33 +73,33 @@ cols/rows/magnets), degraded preview during interaction.
   (not the grid props) so the stale mesh stays put while the worker rebuilds — don't
   "simplify" it to `rows * PITCH`. (The worker keeps row 0 at its *top* y; the −90° X
   rotation plus that offset produces the layout above.)
-- **Camera flights:** every programmatic move is a 0.65s eased flight toward
-  `goalRef.current`, interpolated in **orbit-angle space** (azimuth unwound the short
-  way, polar, radius, plus target lerp — all on one eased progress). Not a position
-  lerp and not a view-direction slerp: both concentrate the roll/heading twist at the
-  top-down pole, which reads as rotation lagging translation. Goals with
-  `sticky: true` (restoring the user's exact pre-drag pose) outrank the cols/rows
-  refit effect; any OrbitControls `start` (user orbit/pan/zoom) cancels the flight.
+- **The camera belongs to the user:** it starts on `perspectivePose(cols, rows)` (a
+  three-quarter view) and is never moved programmatically after that — resizing happens
+  in place from whatever view the user is in; no refit, no flight (the earlier fly-to-top
+  drag and post-resize refit were removed in Sept 2026 as confusing). `page.tsx` mounts
+  the Viewer only once `hydrated`, so that one-time pose frames the *restored* design.
+  If a fit-view button is ever wanted, the eased orbit-angle-space flight rig
+  (`CameraRig`) is in git history just before that change.
 - **Handle icons:** the three resize handles are `assets/resize.svg` (a vertical double
   chevron) drawn flat on the ground: Next's static import gives the URL, `SVGLoader`
   turns it into one merged `ShapeGeometry` (`useResizeIconGeometry`), rotated so
-  SVG-down maps to +z (screen-down in the top view) and spun per axis (`AXIS_SPIN`).
+  SVG-down maps to +z (screen-down when seen from above) and spun per axis (`AXIS_SPIN`).
   The icon is not pickable; an oversized invisible box above it takes the pointer. States:
   rest = half size + half opacity on the ground, hover = full opacity + 3mm lift,
   dragging = full size while the other two fade out (and stop taking the pointer); all ease
   in `useFrame` (the initial scale/opacity props are stable primitives, so re-renders
   don't snap them). The corner icon sits at `HANDLE_GAP / √2` per axis so it is as far
   from the tray as the edge ones. No cursor change on hover — by request.
-- **Handle drag flow:** pointerdown disables controls, saves the current pose, and
-  flies to a top view with growth room right/bottom; moves use window-level listeners
-  and **absolute** snapping (the dragged edge goes to the grid line nearest the
-  pointer — stays correct while the camera is still flying); release commits once
-  (Escape cancels). The shadow persists after commit until a mesh **newer than the
+- **Handle drag flow:** pointerdown disables controls (a mapping with orbit/pan on the
+  left button must not also move the view); moves use window-level listeners and
+  **absolute** snapping — the pointer is raycast onto the ground plane and the dragged
+  edge goes to the grid line nearest that point, from any viewing angle; release
+  commits once (Escape cancels). The shadow persists after commit until a mesh **newer than the
   commit-time one** arrives (`baseMesh` identity compare), masking the rebuild.
 - **Stable camera props:** the `Canvas` `camera` object lives in a `useState`
   initializer and OrbitControls gets its target imperatively (not as a prop) — a
   fresh object/array identity on re-render re-applies the prop and teleports the
-  camera / snaps the target mid-flight.
+  camera / snaps the target back under the user's orbit/pan.
 - A grid shrink from the 3D handles can invalidate the live cell selection; Viewer
   derives a `sel` guard instead of clearing state (no setState-in-effect).
 - **3D cell selection (`CellSelector`):** left-drag on the tray selects cells with the
