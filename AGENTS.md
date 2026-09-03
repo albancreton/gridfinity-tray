@@ -105,9 +105,15 @@ cols/rows/magnets), degraded preview during interaction.
   opposite edge stays put (size clamped to 1..12); release commits once via
   `onResize(frame)` (Escape cancels) and clears the cell selection, whose indices would
   shift under a left/top resize. The shadow (`ShadowState`, a `Frame` in the *displayed*
-  world's units, so `c0 < 0` after a left grow) persists after commit until a mesh
+  world's units, so `c0 < 0` after a left grow) floats at the wall top (`trayTopY`) and persists after commit until a mesh
   **newer than the commit-time one** arrives (`baseMesh` identity compare), masking the
-  rebuild; that same mesh change consumes the pending camera shift. While a committed
+  rebuild; that same mesh change consumes the pending camera shift. The shadow state lives
+  in `Viewer` because the tray renders from it too: `TrayMesh`'s `ghost` prop feeds
+  `uGhost*` uniforms and fragments outside the kept box (expanded by wall/2 so the future
+  outer wall stays solid) get 25% alpha — via **alpha-to-coverage** on the still-opaque
+  material, which the multisampled canvas resolves to a clean fade with no self-overlap
+  sorting artifacts; the edge lines get the same factor through their own
+  `onBeforeCompile` sharing the uniform objects. While a committed
   shadow is waiting, the handles are inert — a new drag would straddle the frame change.
 - **Stable camera props:** the `Canvas` `camera` object lives in a `useState`
   initializer and OrbitControls gets its target imperatively (not as a prop) — a
