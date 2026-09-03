@@ -1,10 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useFrame, useLoader, useThree, type ThreeEvent } from "@react-three/fiber";
 import { OrbitControls, Grid, Html, useCursor } from "@react-three/drei";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
+import { SVGLoader } from "three/examples/jsm/loaders/SVGLoader.js";
+import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
+import resizeIcon from "../../assets/resize.svg";
 import {
   BASE_H,
   CLEAR,
@@ -250,18 +253,23 @@ function CameraRig({ cols, rows, goalRef }: { cols: number; rows: number; goalRe
 
 // --- 3D resize handles -------------------------------------------------------
 
-const HANDLE_GAP = 8; // mm from tray edge to handle center
-const HANDLE_LEN = 22;
-const HANDLE_THICK = 3.5;
-const HANDLE_H = 3;
+const HANDLE_GAP = 12; // mm from tray edge to icon center
+// The corner icon sits on the diagonal at the same distance from the tray as the edge ones.
+const HANDLE_GAP_DIAG = HANDLE_GAP / Math.SQRT2;
+const HANDLE_ICON = 16; // icon height in mm (the SVG's 24-unit viewBox maps to this)
+const HANDLE_HIT_LONG = 36; // hit box extent along the edge the handle sits on
+const HANDLE_HIT_SHORT = 20;
+const HANDLE_HIT_H = 10;
+const HANDLE_REST_SCALE = 0.5;
+const HANDLE_REST_OPACITY = 0.5;
+const HANDLE_REST_Y = 0.25; // just above the ground grid
+const HANDLE_HOVER_Y = 3; // mm the icon lifts while hovered or dragged
+const RESIZE_ICON_URL: string = resizeIcon.src;
 
 type Axis = "x" | "y" | "xy";
 
-const AXIS_CURSOR: Record<Axis, string> = {
-  x: "ew-resize",
-  y: "ns-resize",
-  xy: "nwse-resize",
-};
+/** Spin about y so the double chevron points along the axis it resizes. */
+const AXIS_SPIN: Record<Axis, number> = { x: Math.PI / 2, y: 0, xy: Math.PI / 4 };
 
 interface ShadowState {
   cols: number;
@@ -273,27 +281,105 @@ interface ShadowState {
   baseMesh: MeshData | null;
 }
 
+/**
+ * resize.svg's two chevrons as one flat geometry: centred, `HANDLE_ICON` tall,
+ * lying on the ground with SVG-down mapped to +z. Handle drags happen in the
+ * top view, where +z is screen-down, so the icon reads as it does in the 2D editor.
+ */
+function useResizeIconGeometry(): THREE.BufferGeometry {
+  const { paths } = useLoader(SVGLoader, RESIZE_ICON_URL);
+  const geometry = useMemo(() => {
+    const parts = paths.flatMap((p) => p.toShapes().map((s) => new THREE.ShapeGeometry(s)));
+    const merged = mergeGeometries(parts) ?? new THREE.BufferGeometry();
+    parts.forEach((p) => p.dispose());
+    const k = HANDLE_ICON / 24;
+    merged.translate(-12, -12, 0).scale(k, k, 1).rotateX(Math.PI / 2);
+    return merged;
+  }, [paths]);
+  useEffect(() => () => geometry.dispose(), [geometry]);
+  return geometry;
+}
+
+/**
+ * One handle's chevrons. At rest: half size, half opacity, on the ground. Hover:
+ * full opacity and a small lift. In use (dragging): full size, and the other two
+ * handles fade out (`dimmed`). All ease over ~100ms
+ * in the frame loop; the initial props are stable primitives so re-renders never
+ * snap them.
+ */
+function HandleIcon({
+  axis,
+  hover,
+  active,
+  dimmed,
+}: {
+  axis: Axis;
+  hover: boolean;
+  active: boolean;
+  dimmed: boolean;
+}) {
+  const geometry = useResizeIconGeometry();
+  const meshRef = useRef<THREE.Mesh>(null);
+  const matRef = useRef<THREE.MeshBasicMaterial>(null);
+  const targetScale = active ? 1 : HANDLE_REST_SCALE;
+  const targetOpacity = dimmed ? 0 : hover || active ? 1 : HANDLE_REST_OPACITY;
+  const targetY = hover || active ? HANDLE_HOVER_Y : HANDLE_REST_Y;
+  useFrame((_, dt) => {
+    const m = meshRef.current;
+    const mat = matRef.current;
+    if (!m || !mat) return;
+    const k = 1 - Math.exp(-dt * 18);
+    m.scale.setScalar(THREE.MathUtils.lerp(m.scale.x, targetScale, k));
+    mat.opacity = THREE.MathUtils.lerp(mat.opacity, targetOpacity, k);
+    m.position.y = THREE.MathUtils.lerp(m.position.y, targetY, k);
+  });
+  return (
+    <mesh
+      ref={meshRef}
+      geometry={geometry}
+      position-y={HANDLE_REST_Y}
+      rotation-y={AXIS_SPIN[axis]}
+      scale={HANDLE_REST_SCALE}
+      raycast={() => null}
+      renderOrder={5}
+    >
+      <meshBasicMaterial
+        ref={matRef}
+        color="#e4e4e7"
+        transparent
+        opacity={HANDLE_REST_OPACITY}
+        side={THREE.DoubleSide}
+        depthWrite={false}
+      />
+    </mesh>
+  );
+}
+
 function Handle({
   x,
   z,
   axis,
   active,
+  dimmed,
   onDown,
 }: {
   x: number;
   z: number;
   axis: Axis;
   active: boolean;
+  /** Another handle is in use: fade out and stop taking the pointer. */
+  dimmed: boolean;
   onDown: (axis: Axis, e: ThreeEvent<PointerEvent>) => void;
 }) {
   const [hover, setHover] = useState(false);
-  useCursor(hover || active, AXIS_CURSOR[axis]);
-  const sx = axis === "y" ? HANDLE_LEN : axis === "x" ? HANDLE_THICK : 7;
-  const sz = axis === "x" ? HANDLE_LEN : axis === "y" ? HANDLE_THICK : 7;
+  const hx = axis === "y" ? HANDLE_HIT_LONG : axis === "x" ? HANDLE_HIT_SHORT : 24;
+  const hz = axis === "x" ? HANDLE_HIT_LONG : axis === "y" ? HANDLE_HIT_SHORT : 24;
   return (
-    <group position={[x, HANDLE_H / 2, z]}>
-      {/* oversized invisible hit box so the small bar is easy to grab */}
+    <group position={[x, 0, z]}>
+      {/* oversized invisible hit box so the flat icon is easy to grab */}
       <mesh
+        position-y={HANDLE_HIT_H / 2}
+        visible={!dimmed}
         onPointerDown={(e) => onDown(axis, e)}
         onPointerOver={(e) => {
           e.stopPropagation();
@@ -301,13 +387,12 @@ function Handle({
         }}
         onPointerOut={() => setHover(false)}
       >
-        <boxGeometry args={[sx + 14, HANDLE_H + 8, sz + 14]} />
+        <boxGeometry args={[hx, HANDLE_HIT_H, hz]} />
         <meshBasicMaterial transparent opacity={0} depthWrite={false} />
       </mesh>
-      <mesh raycast={() => null}>
-        <boxGeometry args={[sx, HANDLE_H, sz]} />
-        <meshBasicMaterial color={hover || active ? "#38bdf8" : "#7a7a83"} />
-      </mesh>
+      <Suspense fallback={null}>
+        <HandleIcon axis={axis} hover={hover && !dimmed} active={active} dimmed={dimmed} />
+      </Suspense>
     </group>
   );
 }
@@ -469,6 +554,7 @@ function ResizeHandles3D({
         z={pd / 2}
         axis="x"
         active={visible?.axis === "x"}
+        dimmed={visible !== null && visible.axis !== "x"}
         onDown={beginDrag}
       />
       <Handle
@@ -476,13 +562,15 @@ function ResizeHandles3D({
         z={pd + HANDLE_GAP}
         axis="y"
         active={visible?.axis === "y"}
+        dimmed={visible !== null && visible.axis !== "y"}
         onDown={beginDrag}
       />
       <Handle
-        x={pw + HANDLE_GAP}
-        z={pd + HANDLE_GAP}
+        x={pw + HANDLE_GAP_DIAG}
+        z={pd + HANDLE_GAP_DIAG}
         axis="xy"
         active={visible?.axis === "xy"}
+        dimmed={visible !== null && visible.axis !== "xy"}
         onDown={beginDrag}
       />
     </group>
@@ -683,7 +771,7 @@ function makeRegionTexture(): THREE.DataTexture {
  * tinted, except horizontal top-rim faces and the outer shell (fragments near
  * the box boundary whose normal points outward — margin 4.3 covers the outer
  * corner radius 3.75 + clearance). The box floor sits just under the pocket
- * floor so the feet stay orange.
+ * floor so the feet keep the base color.
  *
  * Printed look — an analytic FDM height field bumps the normal per fragment:
  * layer beads stacked along world y (print height; the bed is y=0) on walls and
@@ -970,7 +1058,7 @@ if (uPrint > 0.5) {
       <group position={offset}>
         <mesh ref={pickRef} geometry={geometry} castShadow receiveShadow>
           <meshStandardMaterial
-            color="#e07a3f"
+            color="#59B9BA"
             roughness={0.55}
             metalness={0.05}
             polygonOffset
@@ -980,7 +1068,7 @@ if (uPrint > 0.5) {
           />
         </mesh>
         <lineSegments geometry={edgeGeometry}>
-          <lineBasicMaterial color="#3a2417" transparent opacity={0.4} />
+          <lineBasicMaterial color="#0f3536" transparent opacity={0.4} />
         </lineSegments>
       </group>
     </group>

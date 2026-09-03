@@ -23,7 +23,7 @@ react-three-fiber 9 + drei 10 · replicad 1.0 over OpenCASCADE WASM, in a web wo
 
 ## Commands
 
-- `npm run dev` — dev server. **Usually already running on :3000** (check before starting
+- `npm run dev` — dev server. **Usually already running on :3100** (check before starting
   a second one; `next dev` refuses duplicates for this dir anyway). Hot reload works.
 - `npx tsc --noEmit && npx eslint src --max-warnings 0` — the check to run after changes.
 - `npm run build` — production build (prebuild copies the WASM, see below).
@@ -79,6 +79,16 @@ cols/rows/magnets), degraded preview during interaction.
   top-down pole, which reads as rotation lagging translation. Goals with
   `sticky: true` (restoring the user's exact pre-drag pose) outrank the cols/rows
   refit effect; any OrbitControls `start` (user orbit/pan/zoom) cancels the flight.
+- **Handle icons:** the three resize handles are `assets/resize.svg` (a vertical double
+  chevron) drawn flat on the ground: Next's static import gives the URL, `SVGLoader`
+  turns it into one merged `ShapeGeometry` (`useResizeIconGeometry`), rotated so
+  SVG-down maps to +z (screen-down in the top view) and spun per axis (`AXIS_SPIN`).
+  The icon is not pickable; an oversized invisible box above it takes the pointer. States:
+  rest = half size + half opacity on the ground, hover = full opacity + 3mm lift,
+  dragging = full size while the other two fade out (and stop taking the pointer); all ease
+  in `useFrame` (the initial scale/opacity props are stable primitives, so re-renders
+  don't snap them). The corner icon sits at `HANDLE_GAP / √2` per axis so it is as far
+  from the tray as the edge ones. No cursor change on hover — by request.
 - **Handle drag flow:** pointerdown disables controls, saves the current pose, and
   flies to a top view with growth room right/bottom; moves use window-level listeners
   and **absolute** snapping (the dragged edge goes to the grid line nearest the
@@ -107,7 +117,7 @@ cols/rows/magnets), degraded preview during interaction.
   own fragments via `onBeforeCompile` uniforms — inside the selection's world box, minus
   horizontal top-rim faces (`n.y > 0.9` above `topZ − 0.8`) and outer-shell fragments
   (outward normal within 4.3mm of a box side, covering corner radius 3.75 + clearance).
-  The box floor sits just under the pocket floor so feet stay orange. Its vertical
+  The box floor sits just under the pocket floor so feet keep the base color. Its vertical
   bounds recompute the worker's `topZ`/`floorZ` formulas from `TrayParams` — keep them
   in sync with `cad.worker.ts`. Uniforms live in a ref and are mutated in an effect
   (never recreate the material; the shader patch compiles once).
