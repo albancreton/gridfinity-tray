@@ -20,7 +20,7 @@ import {
   type TraySpec,
 } from "@/lib/protocol";
 import { meshBounds, meshVolume, type TrayGeometry } from "@/lib/trayMesher";
-import { buildTrayParts, mergeParts, type PartitionedTray, type TrayPart } from "@/lib/trayParts";
+import { mergeParts, type PartitionedTray, type TrayPart } from "@/lib/trayParts";
 import { presets, restPose, type Playback, type Pose } from "@/lib/animPresets";
 import { makeTransition, type EntityAnim, type Snapshot, type Transition } from "@/lib/transitions";
 import { requestMesh } from "@/lib/cadClient";
@@ -34,7 +34,6 @@ import {
   canSplitSelection,
   expandSelection,
   fuse,
-  reframe,
   regionAt,
   split,
 } from "@/lib/grid";
@@ -327,21 +326,50 @@ function Handle({
  * outline rather than a mark on the ground.
  */
 /**
- * The pending footprint's size, pinned past its bottom-right corner at the wall
- * top. The footprint itself is shown by the tray: the ghosted part a shrink
- * removes and the half-coverage preview of what a grow adds.
+ * The pending footprint, flat on the ground: a translucent fill, a line per
+ * unit boundary and the size badge. Drawn without depth testing so it reads
+ * through the tray from any angle. Restored Sept 2026 in place of the
+ * wall-top shadow and the half-coverage preview of the future tray.
  */
-function SizeLabel({ c0, r0, c1, r1, y }: Frame & { y: number }) {
+function SizeGrid({ c0, r0, c1, r1 }: Frame) {
+  const x0 = c0 * PITCH;
+  const x1 = c1 * PITCH;
+  const z0 = r0 * PITCH;
+  const z1 = r1 * PITCH;
+  const lines = useMemo(() => {
+    const pts: number[] = [];
+    for (let c = c0; c <= c1; c++) pts.push(c * PITCH, 0, z0, c * PITCH, 0, z1);
+    for (let r = r0; r <= r1; r++) pts.push(x0, 0, r * PITCH, x1, 0, r * PITCH);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pts), 3));
+    return g;
+  }, [c0, r0, c1, r1, x0, x1, z0, z1]);
+  useEffect(() => () => lines.dispose(), [lines]);
   return (
-    <Html
-      position={[c1 * PITCH + 14, y + 0.2, r1 * PITCH + 14]}
-      center
-      style={{ pointerEvents: "none" }}
-    >
-      <div className="rounded-md bg-sky-500 px-2 py-0.5 text-xs font-semibold whitespace-nowrap text-white tabular-nums">
-        {c1 - c0} × {r1 - r0}
-      </div>
-    </Html>
+    <group position={[0, 0.6, 0]}>
+      <mesh
+        position={[(x0 + x1) / 2, 0, (z0 + z1) / 2]}
+        rotation={[-Math.PI / 2, 0, 0]}
+        renderOrder={10}
+      >
+        <planeGeometry args={[x1 - x0, z1 - z0]} />
+        <meshBasicMaterial
+          color="#38bdf8"
+          transparent
+          opacity={0.14}
+          depthTest={false}
+          depthWrite={false}
+        />
+      </mesh>
+      <lineSegments geometry={lines} renderOrder={11}>
+        <lineBasicMaterial color="#7dd3fc" transparent opacity={0.8} depthTest={false} />
+      </lineSegments>
+      <Html position={[x1 + 14, 0, z1 + 14]} center style={{ pointerEvents: "none" }}>
+        <div className="rounded-md bg-sky-500 px-2 py-0.5 text-xs font-semibold whitespace-nowrap text-white tabular-nums">
+          {c1 - c0} × {r1 - r0}
+        </div>
+      </Html>
+    </group>
   );
 }
 
@@ -359,7 +387,6 @@ function ResizeHandles3D({
   rows,
   geometry,
   trayRef,
-  topY,
   shadow: visible,
   setShadow,
   onResize,
@@ -370,8 +397,6 @@ function ResizeHandles3D({
   geometry: TrayGeometry;
   /** The visible tray mesh, so handles it covers ignore the pointer. */
   trayRef: React.RefObject<THREE.Mesh | null>;
-  /** Height of the wall top, where the shadow floats. */
-  topY: number;
   /** The shadow currently shown (live, or committed and waiting); Viewer owns it. */
   shadow: ShadowState | null;
   setShadow: (s: ShadowState | null) => void;
@@ -448,9 +473,8 @@ function ResizeHandles3D({
     const finish = (commit: boolean) => {
       detach();
       if (controls) controls.enabled = true;
-      // The ghost/preview goes first, on its own frame; the commit (re-mesh,
-      // partition, entity meshes) follows on the next one, so the two never
-      // share a frame. The layout effect above applies the camera shift in the
+      // The grid goes first, on its own frame; the commit (re-mesh, partition,
+      // entity meshes) follows on the next one, so the two never share a frame. The layout effect above applies the camera shift in the
       // commit that swaps the geometry.
       setShadow(null);
       if (commit && !sameFrame(frame, start)) {
@@ -496,7 +520,7 @@ function ResizeHandles3D({
   return (
     <group>
       {visible && (
-        <SizeLabel c0={visible.c0} r0={visible.r0} c1={visible.c1} r1={visible.r1} y={topY} />
+        <SizeGrid c0={visible.c0} r0={visible.r0} c1={visible.c1} r1={visible.r1} />
       )}
       {SIDES.map((side) => (
         <Handle
@@ -747,7 +771,6 @@ function TrayMesh({
   view,
   ghost,
   ghostAlpha = 0.25,
-  ghostInside = 1,
   pose,
   origin,
   revealable = false,
@@ -766,12 +789,9 @@ function TrayMesh({
   grid: GridState;
   params: TrayParams;
   view: ViewSettings;
-  /** Resize footprint (displayed-world units): fragments outside it get `ghostAlpha`, inside `ghostInside`. */
+  /** Resize footprint (displayed-world units): fragments outside it fade to `ghostAlpha` — the part a shrink removes. */
   ghost: Frame | null;
-  /** Coverage outside the ghost box; 0.25 = the part a shrink removes. */
   ghostAlpha?: number;
-  /** Coverage inside the ghost box; 0 hides the future tray where the current one still stands. */
-  ghostInside?: number;
   pickRef?: React.Ref<THREE.Mesh>;
 }) {
   const uniforms = useRef({
@@ -779,11 +799,10 @@ function TrayMesh({
     uSelMax: { value: new THREE.Vector3() },
     uSelActive: { value: 0 },
     uGhostOn: { value: 0 },
-    /** Ghost box in world xz; fragments outside get `uGhostAlpha`, inside `uGhostInside`. */
+    /** Ghost box in world xz; fragments outside it fade to `uGhostAlpha`. */
     uGhostMin: { value: new THREE.Vector2() },
     uGhostMax: { value: new THREE.Vector2() },
     uGhostAlpha: { value: 0.25 },
-    uGhostInside: { value: 1 },
     /** Fraction of the tray height that exists yet (the print-in reveal); 1 = whole. */
     uReveal: { value: 1 },
     /** Height a fully revealed tray reaches (a hair above the rim). */
@@ -814,14 +833,13 @@ function TrayMesh({
     const u = uniforms.current;
     u.uGhostOn.value = ghost ? 1 : 0;
     u.uGhostAlpha.value = ghostAlpha;
-    u.uGhostInside.value = ghostInside;
     if (!ghost) return;
     // Interior walls straddle the grid line by wall/2: keep the one that
     // becomes the new outer wall solid, so the kept part reads as a whole tray.
     const m = params.wall / 2;
     u.uGhostMin.value.set(ghost.c0 * PITCH - m, ghost.r0 * PITCH - m);
     u.uGhostMax.value.set(ghost.c1 * PITCH + m, ghost.r1 * PITCH + m);
-  }, [ghost, ghostAlpha, ghostInside, params.wall]);
+  }, [ghost, ghostAlpha, params.wall]);
 
   useEffect(() => {
     uniforms.current.uAnimTop.value = trayTopY(params) + 0.5;
@@ -921,7 +939,6 @@ uniform float uGhostOn;
 uniform vec2 uGhostMin;
 uniform vec2 uGhostMax;
 uniform float uGhostAlpha;
-uniform float uGhostInside;
 uniform float uReveal;
 uniform float uAnimTop;
 varying vec3 vWorldNormal;
@@ -1024,8 +1041,8 @@ if (uReveal < 1.0 && vLocalPos.y >= uReveal * uAnimTop) discard;
 if (uGhostOn > 0.5) {
   bool outsideGhost = vWorldPos.x < uGhostMin.x || vWorldPos.x > uGhostMax.x ||
     vWorldPos.z < uGhostMin.y || vWorldPos.z > uGhostMax.y;
-  // Zero alpha is zero MSAA coverage: nothing is written, no discard needed.
-  diffuseColor.a *= outsideGhost ? uGhostAlpha : uGhostInside;
+  // Partial alpha is partial MSAA coverage; no discard needed.
+  if (outsideGhost) diffuseColor.a *= uGhostAlpha;
 }
 if (uSelActive > 0.5) {
   vec3 n = normalize(vWorldNormal);
@@ -1097,7 +1114,6 @@ if (uPrint > 0.5) {
         uGhostMin: u.uGhostMin,
         uGhostMax: u.uGhostMax,
         uGhostAlpha: u.uGhostAlpha,
-        uGhostInside: u.uGhostInside,
         uReveal: u.uReveal,
         uAnimTop: u.uAnimTop,
         uLocalOrigin: u.uLocalOrigin,
@@ -1121,7 +1137,6 @@ uniform float uGhostOn;
 uniform vec2 uGhostMin;
 uniform vec2 uGhostMax;
 uniform float uGhostAlpha;
-uniform float uGhostInside;
 uniform float uReveal;
 uniform float uAnimTop;`,
         )
@@ -1131,8 +1146,7 @@ uniform float uAnimTop;`,
 if (uGhostOn > 0.5) {
   bool outsideGhost = vWorldPos.x < uGhostMin.x || vWorldPos.x > uGhostMax.x ||
     vWorldPos.z < uGhostMin.y || vWorldPos.z > uGhostMax.y;
-  diffuseColor.a *= outsideGhost ? uGhostAlpha : uGhostInside;
-  if (diffuseColor.a < 0.01) discard;
+  if (outsideGhost) diffuseColor.a *= uGhostAlpha;
 }
 if (uReveal < 1.0 && vLocalPos.y >= uReveal * uAnimTop) discard;`,
         );
@@ -1409,7 +1423,7 @@ export default function Viewer({
   const [selection, setSelection] = useState<Region | null>(null);
   const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
   // Pending resize footprint. Lives here because both the handles (label,
-  // handle placement) and the tray (ghost, grow preview) render from it.
+  // handle placement) and the tray (ghosting what a shrink removes) render from it.
   const [shadow, setShadow] = useState<ShadowState | null>(null);
 
   // --- Transitions: how the last layout turns into this one ----------------
@@ -1446,27 +1460,6 @@ export default function Viewer({
       topZ: geometry.topZ,
     };
   }, [geometry, anim]);
-  // Grow preview: while the pending footprint reaches past the current tray, mesh
-  // the future tray (its cell (0,0) lands at the frame's origin) and draw it at
-  // half coverage where the current tray isn't — the "add" counterpart of the
-  // 25% ghost a shrink puts on the part being removed.
-  const fc0 = shadow?.c0 ?? 0;
-  const fr0 = shadow?.r0 ?? 0;
-  const fc1 = shadow?.c1 ?? cols;
-  const fr1 = shadow?.r1 ?? rows;
-  const grows = shadow !== null && (fc0 < 0 || fr0 < 0 || fc1 > cols || fr1 > rows);
-  const preview = useMemo(() => {
-    if (!grows) return null;
-    const next = reframe(grid, { c0: fc0, r0: fr0, c1: fc1, r1: fr1 });
-    const spec: TraySpec = { ...params, cols: next.cols, rows: next.rows, regions: allRegions(next) };
-    return {
-      // Same builder (and cache) as the state owner's: the commit reuses this result.
-      geometry: buildTrayParts(spec),
-      grid: next,
-      offset: [fc0 * PITCH, 0, fr0 * PITCH] as [number, number, number],
-    };
-  }, [grows, fc0, fr0, fc1, fr1, grid, params]);
-  const footprint = useMemo<Frame>(() => ({ c0: 0, r0: 0, c1: cols, r1: rows }), [cols, rows]);
   // A shrink (2D or 3D handles) can leave the selection out of bounds; treat as cleared.
   const sel = selection && selection.c1 < cols && selection.r1 < rows ? selection : null;
 
@@ -1535,20 +1528,6 @@ export default function Viewer({
           />
         ))}
         {anim && <TransitionEnd key={anim.start} duration={anim.duration} onDone={() => setAnim(null)} />}
-        {preview && (
-          <group position={preview.offset}>
-            <TrayMesh
-              geometry={preview.geometry}
-              sel={null}
-              grid={preview.grid}
-              params={params}
-              view={view}
-              ghost={footprint}
-              ghostInside={0}
-              ghostAlpha={0.5}
-            />
-          </group>
-        )}
         {process.env.NODE_ENV === "development" && view.cadOverlay && (
           <CadOverlay spec={spec} geometry={geometry} />
         )}
@@ -1557,7 +1536,6 @@ export default function Viewer({
           rows={rows}
           geometry={geometry}
           trayRef={trayPickRef}
-          topY={trayTopY(params)}
           shadow={shadow}
           setShadow={setShadow}
           onResize={handleResize}

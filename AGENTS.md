@@ -40,14 +40,14 @@ react-three-fiber 9 + drei 10 · replicad 1.0 over OpenCASCADE WASM, in a web wo
 |---|---|
 | `src/app/page.tsx` | State owner: `GridState` + `TrayParams` → `TraySpec` → `buildTrayParts(spec)` in a `useMemo` (synchronous, no debounce); plus render-only `ViewSettings`; localStorage persistence (`gridfinity-tray-v1`); export handler (the only worker call); size readout |
 | `src/components/Toolbar.tsx` | Floating top-left buttons (Base UI `Popover`): Settings (params, printed look, layer height, dev-only CAD overlay toggle) and Export (STL / STEP) |
-| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (uploads flat-shaded triangles + edge lines; selection-tint, ghost, reveal and printed-look shader patches; applies an animation `pose`), `EntityMesh` + `TransitionEnd` (animation playback), `CadOverlay` (dev builds: the worker's B-rep edges in red + `window.__compare()`), `ResizeHandles3D` (four edge handles: ghost/preview while dragging, commit on release, camera compensation for left/top resizes), `MappedControls` (view controls; sets the one-time initial orbit target) |
+| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (uploads flat-shaded triangles + edge lines; selection-tint, ghost, reveal and printed-look shader patches; applies an animation `pose`), `EntityMesh` + `TransitionEnd` (animation playback), `CadOverlay` (dev builds: the worker's B-rep edges in red + `window.__compare()`), `ResizeHandles3D` (four edge handles + `SizeGrid`, the ground footprint overlay; commit on release, camera compensation for left/top resizes), `MappedControls` (view controls; sets the one-time initial orbit target) |
 | `src/lib/transitions.ts` | Pure diff of two partitioned trays into a `Transition`: entering/leaving `EntityAnim`s (cells with everything that belongs to them, lone walls) with presets, delays and directions |
 | `src/lib/animPresets.ts` | The animation presets (`cellIn`, `explode`, ...): each drives a plain `Pose` with Motion's `animate()`; durations, distances and the slow-motion knob live here |
 | `src/lib/grid.ts` | Pure grid model: `merges: Region[]` (only >1-cell merges stored; uncovered cells are implicit 1×1). `expandSelection` grows a rect over touched merges until stable — spreadsheet semantics. `reframe(state, frame)` re-outlines the grid to a `Frame` (end-exclusive, in the current grid's units, so `c0 < 0` adds columns on the left): merges move with their cells and are clipped at the new bounds |
 | `src/lib/protocol.ts` | Shared types (`TraySpec`, `MeshData`, worker messages) + shared mm constants (incl. `R_OUT`, used by both the worker and the printed-look shader) + `traySizeMm()` |
 | `src/lib/layout.ts` | **Single source of truth for every dimension**: `levels()` (topZ / floorZ / dividerTop), `outerOutline`, `pocketRect` (insets + corner radius), foot loft rings, magnet centers, the lip socket profile. Plan coordinates = the viewer's world xz (x along columns, z along rows, row 0 at z 0..42); heights in mm above the bed. Used by the worker, the mesher and (by hand-copied #defines) the shader |
 | `src/lib/trayMesher.ts` | Procedural preview mesher: emits the tray's *exterior faces* directly — no solid booleans. Wall top = a height field of the inset from the outer outline (`topBands`: rim / chamfer / step / chamfer / socket floor, plus `wall` as a boundary), built as ring-quads near the outline and, for the flat divider network, **per cell** (interior cells analytically: a strip per walled side + a cove per walled corner; boundary cells 2D-clipped with `polygon-clipping`); walls hang off the polygons' edges (classified as pocket / outer / iso-ring); pocket floors, feet lofts, magnet pockets and the underside gaps are analytic. Also emits the B-rep-style edge lines and flat normals. Dev hook `window.__buildTray` |
-| `src/lib/trayParts.ts` | **Part partition** of the mesher's soup into animatable entities (`TrayPart`: foot, cell, divider segment, junction post, outer-wall stretch, tray corner), each an exact tile of the tray; `buildTrayParts(spec)` = mesh + partition, and `PartitionedTray` carries both the parts and their merged arrays (what renders when nothing animates). See "Parts". Dev hook `window.__buildTrayParts` |
+| `src/lib/trayParts.ts` | **Part partition** of the mesher's soup into animatable entities (`TrayPart`: foot, cell, divider segment, junction post, outer-wall stretch, tray corner), each an exact tile of the tray; `buildTrayParts(spec)` meshes eagerly and partitions **lazily** (`parts` is a getter, so a drag preview pays for the mesh alone); `PartitionedTray` also carries the merged arrays, which is what renders when nothing animates. See "Parts". Dev hook `window.__buildTrayParts` |
 | `src/lib/viewMapping.ts` | Mouse-button → view-action presets (pure data). Active: `"fusion"` (middle=pan, shift+middle=orbit, wheel=zoom, left/right free) |
 | `src/lib/viewSettings.ts` | Render-only settings (`printLook`, `layerHeight`) + defaults. They never reach the worker — a change must not trigger a rebuild |
 | `src/lib/cadClient.ts` | Worker singleton, promise-per-request, `downloadBlob` |
@@ -143,28 +143,28 @@ floor and the preview just lowers the floor.
   edge goes to the grid line nearest that point, from any viewing angle, while the
   opposite edge stays put (size clamped to 1..12); release commits once via
   `onResize(frame)` (Escape cancels) and clears the cell selection, whose indices would
-  shift under a left/top resize. The shadow (`ShadowState`, a `Frame` in the *displayed*
-  world's units, so `c0 < 0` after a left grow) is drawn only as a size label
-  (`SizeLabel`) past its bottom-right corner at the wall top (`trayTopY`) — the
-  translucent plane + grid-line overlay it used to have was removed in Sept 2026 once the
-  tray itself showed the footprint (ghost + grow preview below). Release clears it and
-  commits in the same event; the camera shift for a left/top resize is applied by a layout
-  effect keyed on the geometry identity, i.e. in the commit that swaps the geometry (the
-  old "shadow persists until a newer mesh lands" machinery went with the worker). The shadow state lives
-  in `Viewer` because the tray renders from it too: `TrayMesh`'s `ghost` prop feeds
-  `uGhost*` uniforms and fragments outside the kept box (expanded by wall/2 so the future
-  outer wall stays solid) get 25% alpha — via **alpha-to-coverage** on the still-opaque
-  material, which the multisampled canvas resolves to a clean fade with no self-overlap
-  sorting artifacts; the edge lines get the same factor through their own
-  `onBeforeCompile` sharing the uniform objects. **Grow preview:** when the frame reaches
-  past the current footprint, `Viewer` meshes the *future* tray (`reframe` + the mesher,
-  memoized on the frame) and renders a second `TrayMesh` translated by `(c0, r0)·PITCH`
-  with the ghost box = the current footprint, `ghostInside={0}` (hidden where the current
-  tray stands; alpha < 0.01 discards) and `ghostAlpha={0.5}` — so a shrink shows the
-  removed part at 25% and a grow shows the added part at 50%. The print pattern reads
-  `vLocalPos` (object space) rather than world xz so the translated preview keeps its
-  layout aligned; the selection and ghost boxes stay in world space. While a committed
-  shadow is waiting, the handles are inert — a new drag would straddle the frame change.
+  shift under a left/top resize. The pending footprint (`ShadowState`, a `Frame` in the
+  *displayed* world's units, so `c0 < 0` after a left grow) is drawn by `SizeGrid`: a
+  translucent fill, a line per unit boundary and the size badge, **flat on the ground**
+  (y 0.6) with `depthTest={false}` so it reads through the tray from any angle. That
+  overlay was replaced in Sept 2026 by a wall-top label plus a half-coverage preview of
+  the future tray, and restored (on the floor again) by request in Oct 2026 — the preview
+  meshed a second tray on every drag snap and read as clutter. Release clears the grid on
+  its own frame and the commit follows on the next one (`requestAnimationFrame`), so a
+  big tray's rebuild never shares a frame with the overlay teardown; the camera shift for
+  a left/top resize is applied by a layout effect keyed on the geometry identity, i.e. in
+  the commit that swaps the geometry. The state lives in `Viewer` because the tray renders
+  from it too: `TrayMesh`'s `ghost` prop feeds `uGhost*` uniforms and fragments **outside**
+  the kept box (expanded by wall/2 so the future outer wall stays solid) get 25% alpha —
+  via **alpha-to-coverage** on the still-opaque material, which the multisampled canvas
+  resolves to a clean fade with no self-overlap sorting artifacts; the edge lines get the
+  same factor through their own `onBeforeCompile` sharing the uniform objects. So a shrink
+  shows the grid on what is kept and ghosts what is leaving; a grow just shows the grid
+  (nothing of the current tray is leaving). The size badge sits past the footprint's
+  bottom-right corner and can fall outside the viewport on a wide grow — pre-existing,
+  unchanged. The print pattern reads `vLocalPos` (object space) rather than world xz so
+  animating entities, which are re-based at their center, keep their layout aligned; the
+  selection and ghost boxes stay in world space.
 - **Stable camera props:** the `Canvas` `camera` object lives in a `useState`
   initializer and OrbitControls gets its target imperatively (not as a prop) — a
   fresh object/array identity on re-render re-applies the prop and teleports the
