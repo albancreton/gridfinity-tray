@@ -662,8 +662,20 @@ function CellSelector({
 
     const start = cellAt(p);
     const anchor = regionAt(grid, start.r, start.c);
-    let last = expandSelection(grid, anchor);
-    onSelect(last);
+    // A press on an already selected cell is a click-to-deselect unless the
+    // pointer leaves that cell, in which case it becomes a fresh drag. Until
+    // then `last` stays null and the standing selection is left untouched.
+    const inside =
+      selection !== null &&
+      start.r >= selection.r0 &&
+      start.r <= selection.r1 &&
+      start.c >= selection.c0 &&
+      start.c <= selection.c1;
+    let last: Region | null = null;
+    if (!inside) {
+      last = expandSelection(grid, anchor);
+      onSelect(last);
+    }
     setDragging(true);
 
     const dom = gl.domElement;
@@ -680,11 +692,13 @@ function CellSelector({
       raycaster.setFromCamera(ndc, camera);
       if (!pick(hit)) return;
       const pos = cellAt(hit);
+      if (last === null && pos.r === start.r && pos.c === start.c) return;
       const next = expandSelection(
         grid,
         boundingRect(anchor, { r0: pos.r, c0: pos.c, r1: pos.r, c1: pos.c }),
       );
       if (
+        last === null ||
         next.r0 !== last.r0 ||
         next.c0 !== last.c0 ||
         next.r1 !== last.r1 ||
@@ -698,6 +712,11 @@ function CellSelector({
     const up = (ev: PointerEvent) => {
       if (ev.pointerId !== e.pointerId) return;
       detach();
+      if (last === null) {
+        // Click on an already selected cell: deselect, which also closes the popup.
+        onSelect(null);
+        return;
+      }
       // Anchor the popup above the cursor, clamped so it stays on the canvas.
       const rect = dom.getBoundingClientRect();
       onRelease(

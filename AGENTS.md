@@ -111,8 +111,9 @@ cols/rows/magnets), degraded preview during interaction.
   catch-all plane starts selections near the footprint (0.6-pitch forgiveness pad) and
   clears them elsewhere. Releasing shows a Fuse/Split popup: a DOM overlay in Viewer's
   wrapper div anchored above the cursor (clamped to the canvas, `popup-in` keyframes in
-  globals.css). Fuse, split, Escape, and empty-ground clicks all clear the selection
-  and popup. Viewer guards its selection against shrinks like GridEditor does.
+  globals.css). Fuse, split, Escape, empty-ground clicks, and a click on an already selected
+  cell all clear the selection and popup (a press inside the selection only becomes a
+  new drag once the pointer leaves that cell). Viewer guards its selection against shrinks like GridEditor does.
 - **Selection visual = interior tint, not an overlay:** `TrayMesh` recolors the tray's
   own fragments via `onBeforeCompile` uniforms — inside the selection's world box, minus
   horizontal top-rim faces (`n.y > 0.9` above `topZ − 0.8`) and outer-shell fragments
