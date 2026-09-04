@@ -14,6 +14,12 @@ import { PRESET_MS, slowFactor, type PresetName } from "./animPresets";
 export const CELL_STAGGER_MS = 180;
 /** Between consecutive walls landing after a split. */
 export const LAND_STAGGER_MS = 120;
+/**
+ * How far a leaving cell's start slides off the wave, as a fraction of its own
+ * delay: 0.5 means anywhere in ±50% of it. The wave keeps its shape (a cell
+ * twice as late jitters twice as widely) but stops marching in lockstep.
+ */
+export const CELL_DELAY_CHAOS = 0.9;
 
 export interface EntityAnim {
   id: string;
@@ -123,15 +129,27 @@ interface CellOrder {
   along: number;
 }
 
-/** Delays for a wave of cells: nearest-first when growing, farthest-first when shrinking. */
-function schedule(cells: CellOrder[], reverse: boolean, scale: number): Map<string, number> {
+/**
+ * Delays for a wave of cells: nearest-first when growing, farthest-first when
+ * shrinking, each start scattered by `chaos` × its own delay. `rand` returns
+ * [0, 1) per cell — it is seeded off the transition's timestamp rather than
+ * Math.random() because this runs during render.
+ */
+function schedule(
+  cells: CellOrder[],
+  reverse: boolean,
+  scale: number,
+  chaos: number,
+  rand: (i: number) => number,
+): Map<string, number> {
   const delays = new Map<string, number>();
   if (cells.length === 0) return delays;
   const step = Math.min(CELL_STAGGER_MS, 2400 / cells.length) * scale;
   const maxD = Math.max(...cells.map((c) => c.dist));
-  for (const c of cells) {
-    delays.set(c.key, step * ((reverse ? maxD - c.dist : c.dist - 1) + 0.35 * c.along));
-  }
+  cells.forEach((c, i) => {
+    const d = step * ((reverse ? maxD - c.dist : c.dist - 1) + 0.35 * c.along);
+    delays.set(c.key, d * (1 + chaos * (rand(i) * 2 - 1)));
+  });
   return delays;
 }
 
@@ -212,9 +230,10 @@ export function makeTransition(prev: Snapshot, next: Snapshot, frame: Frame | nu
     }
   }
 
+  const rand = (i: number) => hash(i + now);
   const enter = entities(
     enteringParts,
-    schedule(appearing, false, slow),
+    schedule(appearing, false, slow, 0, rand),
     "cellIn",
     (kind) => (kind === "divider" || kind === "post" ? "land" : "fadeIn"),
     LAND_STAGGER_MS * slow,
@@ -222,7 +241,7 @@ export function makeTransition(prev: Snapshot, next: Snapshot, frame: Frame | nu
   );
   const leave = entities(
     leavingParts,
-    schedule(leaving, true, slow),
+    schedule(leaving, true, slow, CELL_DELAY_CHAOS, rand),
     "cellOut",
     (kind) => (kind === "divider" || kind === "post" ? "explode" : "fadeOut"),
     0,

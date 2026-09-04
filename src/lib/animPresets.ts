@@ -49,10 +49,25 @@ export interface Preset {
   play(pose: Pose, ctx: PresetContext): Playback;
 }
 
+/**
+ * The leaving cell's burst, in ms: it shivers sideways while shrinking, holds
+ * still, then blows up and vanishes. Tune these three and the whole preset —
+ * including `PRESET_MS.cellOut`, which the transition's clock reads — follows.
+ */
+export const SHAKE_MS = 600;
+export const SHAKE_HOLD_MS = 0;
+export const BURST_MS = 150;
+/** mm of the first lateral swing; each of the SHAKE_SWINGS steps is that much smaller, ending at 0. */
+export const SHAKE_X = 0.8;
+export const SHAKE_SWINGS = 12;
+/** How much the cell shrinks over the shiver (negative swells it instead), and how big it blows up. */
+export const SHAKE_SHRINK = -0.25;
+export const BURST_SCALE = 2;
+
 /** Nominal durations in ms; the slow-motion knob scales them at play time. */
 export const PRESET_MS = {
   cellIn: 300,
-  cellOut: 200,
+  cellOut: SHAKE_MS + SHAKE_HOLD_MS + BURST_MS,
   fadeIn: 700,
   fadeOut: 700,
   land: 1000,
@@ -70,7 +85,6 @@ export const GHOST_ALPHA = 0.5;
 
 /** mm a cell travels along the up axis while it fades. */
 export const CELL_TRAVEL = 300;
-export const CELL_TRAVEL_OUT = -30;
 /** mm a landing wall drops from. */
 export const LAND_DROP = 200;
 
@@ -102,13 +116,47 @@ export const presets: Record<PresetName, Preset> = {
       return animate(pose, { y: 0, opacity: 1 }, { duration: secs("cellIn"), delay: ctx.delay, ease: "easeOut" });
     },
   },
-  /** The reverse: lifts off and fades. */
+  /**
+   * The reverse, as a fuse gone wrong: a lateral shiver that alternates sides and
+   * damps to nothing while the cell shrinks by SHAKE_SHRINK, a beat of stillness,
+   * then it blows up to BURST_SCALE and is gone. One keyframe track: the shiver
+   * stops, the end of the hold, and the burst.
+   */
   cellOut: {
     prepare(pose) {
       pose.opacity = GHOST_ALPHA;
     },
     play(pose, ctx) {
-      return animate(pose, { y: CELL_TRAVEL_OUT, opacity: 0 }, { duration: secs("cellOut"), delay: ctx.delay, ease: "easeIn" });
+      const n = SHAKE_SWINGS;
+      const total = SHAKE_MS + SHAKE_HOLD_MS + BURST_MS;
+      // Equal swings, alternating sides, each SHAKE_X/n shorter than the last so
+      // the shiver dies out at center — then the hold, then the burst. The hold
+      // only gets a keyframe when it lasts: two stops at the same time would
+      // make Motion interpolate across a zero-length segment.
+      const swings = Array.from({ length: n }, (_, i) => (i % 2 ? -1 : 1) * SHAKE_X * (1 - i / (n - 1)));
+      const stops = Array.from({ length: n + 1 }, (_, i) => (SHAKE_MS * i) / n);
+      const ease: ("easeInOut" | "linear" | "easeOut")[] = Array.from({ length: n }, () => "easeInOut");
+      const x = [0, ...swings];
+      if (SHAKE_HOLD_MS > 0) {
+        stops.push(SHAKE_MS + SHAKE_HOLD_MS);
+        ease.push("linear");
+        x.push(0);
+      }
+      const shrink = (t: number) => 1 - SHAKE_SHRINK * Math.min(1, t / SHAKE_MS);
+      return animate(
+        pose,
+        {
+          x: [...x, 0],
+          scale: [...stops.map(shrink), BURST_SCALE],
+          opacity: [...stops.map(() => GHOST_ALPHA), 0],
+        },
+        {
+          duration: secs("cellOut"),
+          delay: ctx.delay,
+          times: [...stops, total].map((t) => t / total),
+          ease: [...ease, "easeOut"],
+        },
+      );
     },
   },
   fadeIn: {

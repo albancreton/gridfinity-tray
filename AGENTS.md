@@ -266,18 +266,24 @@ floor and the preview just lowers the floor.
   `land`) or a wall stretch/corner that changed role (`fadeOut`/`fadeIn`, e.g. the outer
   wall a grow turns into a divider). Cells get `cellIn`/`cellOut` with the wave delays
   (nearest-first growing, farthest-first shrinking, 0.35 ripple along the edge, ≤180ms
-  stagger, 2400ms budget); each entity also gets a unit `dir` away from the change's
-  center and a `seed`. `duration` = latest delay + preset duration, counted from the
+  stagger, 2400ms budget; leaving cells then scatter by `CELL_DELAY_CHAOS` × their
+  own delay, off `hash(i + now)` rather than `Math.random()` — this runs during
+  render). Each entity also gets a unit `dir` away from the change's center and a
+  `seed`. `duration` = latest delay + preset duration, counted from the
   moment playback starts (see below), not from the pointer event.
 - **Presets (`lib/animPresets.ts`) — the experimentation surface.** A preset drives a
   plain `Pose` (`x y z` mm, `rx ry rz` rad about the entity's center, `scale`,
   `opacity`, `reveal`) with Motion's imperative `animate()` (the `motion` package; its
   React components and the discontinued 3D package are *not* used). `PRESET_MS` holds
-  the nominal durations and `CELL_TRAVEL` / `CELL_TRAVEL_OUT` / `LAND_DROP` the
-  distances (all actively tuned — read them, don't quote them); `slowFactor()` (the
+  the nominal durations and `CELL_TRAVEL` / `LAND_DROP` / the `SHAKE_*`+`BURST_*`
+  set the distances (all actively tuned — read them, don't quote them); `slowFactor()` (the
   `window.__animSlow` knob) scales every duration and delay at play time. Current set:
   `cellIn` (starts `CELL_TRAVEL` above and transparent, settles onto the tray),
-  `cellOut` (slides `CELL_TRAVEL_OUT` and fades away), `fadeIn`, `fadeOut`, `land`
+  `cellOut` (a damped lateral shiver that alternates sides and dies at center
+  while the cell swells, an optional beat of stillness, then a fast blow-up as it
+  fades — `SHAKE_MS`/`SHAKE_HOLD_MS`/`BURST_MS` also set `PRESET_MS.cellOut`, and
+  a zero hold drops its keyframe rather than emitting two stops at one time),
+  `fadeIn`, `fadeOut`, `land`
   (`LAND_DROP` above, ease-out bounce), `explode` (keyframes up and away along `dir`,
   tumbling, fading over the second half), `printIn` (the old bed-up reveal, via
   `reveal`). The two `*Out` presets `prepare` to `GHOST_ALPHA`, not to 1, because the
