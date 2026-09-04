@@ -326,45 +326,63 @@ function Handle({
  * outline rather than a mark on the ground.
  */
 /**
- * The pending footprint, flat on the ground: a translucent fill, a line per
- * unit boundary and the size badge. Drawn without depth testing so it reads
- * through the tray from any angle. Restored Sept 2026 in place of the
- * wall-top shadow and the half-coverage preview of the future tray.
+ * The cells a resize would **add**, flat on the ground: a translucent fill, a
+ * line per unit boundary, plus the resulting size badge. Only one edge moves
+ * per drag, so what is new is a single strip outside the current footprint —
+ * nothing is drawn under the tray that is already there. A shrink adds nothing,
+ * so only the badge shows; what it removes is ghosted on the tray itself.
+ * Drawn without depth testing, so the strip reads from any angle.
  */
-function SizeGrid({ c0, r0, c1, r1 }: Frame) {
-  const x0 = c0 * PITCH;
-  const x1 = c1 * PITCH;
-  const z0 = r0 * PITCH;
-  const z1 = r1 * PITCH;
-  const lines = useMemo(() => {
+function SizeGrid({ c0, r0, c1, r1, cols, rows }: Frame & { cols: number; rows: number }) {
+  const { lines, box } = useMemo(() => {
+    const added: Frame | null =
+      c1 > cols
+        ? { c0: cols, r0, c1, r1 }
+        : c0 < 0
+          ? { c0, r0, c1: 0, r1 }
+          : r1 > rows
+            ? { c0, r0: rows, c1, r1 }
+            : r0 < 0
+              ? { c0, r0, c1, r1: 0 }
+              : null;
     const pts: number[] = [];
-    for (let c = c0; c <= c1; c++) pts.push(c * PITCH, 0, z0, c * PITCH, 0, z1);
-    for (let r = r0; r <= r1; r++) pts.push(x0, 0, r * PITCH, x1, 0, r * PITCH);
+    if (added) {
+      for (let c = added.c0; c <= added.c1; c++) {
+        pts.push(c * PITCH, 0, added.r0 * PITCH, c * PITCH, 0, added.r1 * PITCH);
+      }
+      for (let r = added.r0; r <= added.r1; r++) {
+        pts.push(added.c0 * PITCH, 0, r * PITCH, added.c1 * PITCH, 0, r * PITCH);
+      }
+    }
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pts), 3));
-    return g;
-  }, [c0, r0, c1, r1, x0, x1, z0, z1]);
+    return { lines: g, box: added };
+  }, [c0, r0, c1, r1, cols, rows]);
   useEffect(() => () => lines.dispose(), [lines]);
   return (
     <group position={[0, 0.6, 0]}>
-      <mesh
-        position={[(x0 + x1) / 2, 0, (z0 + z1) / 2]}
-        rotation={[-Math.PI / 2, 0, 0]}
-        renderOrder={10}
-      >
-        <planeGeometry args={[x1 - x0, z1 - z0]} />
-        <meshBasicMaterial
-          color="#38bdf8"
-          transparent
-          opacity={0.14}
-          depthTest={false}
-          depthWrite={false}
-        />
-      </mesh>
-      <lineSegments geometry={lines} renderOrder={11}>
-        <lineBasicMaterial color="#7dd3fc" transparent opacity={0.8} depthTest={false} />
-      </lineSegments>
-      <Html position={[x1 + 14, 0, z1 + 14]} center style={{ pointerEvents: "none" }}>
+      {box && (
+        <>
+          <mesh
+            position={[((box.c0 + box.c1) * PITCH) / 2, 0, ((box.r0 + box.r1) * PITCH) / 2]}
+            rotation={[-Math.PI / 2, 0, 0]}
+            renderOrder={10}
+          >
+            <planeGeometry args={[(box.c1 - box.c0) * PITCH, (box.r1 - box.r0) * PITCH]} />
+            <meshBasicMaterial
+              color="#38bdf8"
+              transparent
+              opacity={0.14}
+              depthTest={false}
+              depthWrite={false}
+            />
+          </mesh>
+          <lineSegments geometry={lines} renderOrder={11}>
+            <lineBasicMaterial color="#7dd3fc" transparent opacity={0.8} depthTest={false} />
+          </lineSegments>
+        </>
+      )}
+      <Html position={[c1 * PITCH + 14, 0, r1 * PITCH + 14]} center style={{ pointerEvents: "none" }}>
         <div className="rounded-md bg-sky-500 px-2 py-0.5 text-xs font-semibold whitespace-nowrap text-white tabular-nums">
           {c1 - c0} × {r1 - r0}
         </div>
@@ -520,7 +538,14 @@ function ResizeHandles3D({
   return (
     <group>
       {visible && (
-        <SizeGrid c0={visible.c0} r0={visible.r0} c1={visible.c1} r1={visible.r1} />
+        <SizeGrid
+          c0={visible.c0}
+          r0={visible.r0}
+          c1={visible.c1}
+          r1={visible.r1}
+          cols={cols}
+          rows={rows}
+        />
       )}
       {SIDES.map((side) => (
         <Handle

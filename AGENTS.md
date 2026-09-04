@@ -144,12 +144,16 @@ floor and the preview just lowers the floor.
   opposite edge stays put (size clamped to 1..12); release commits once via
   `onResize(frame)` (Escape cancels) and clears the cell selection, whose indices would
   shift under a left/top resize. The pending footprint (`ShadowState`, a `Frame` in the
-  *displayed* world's units, so `c0 < 0` after a left grow) is drawn by `SizeGrid`: a
-  translucent fill, a line per unit boundary and the size badge, **flat on the ground**
-  (y 0.6) with `depthTest={false}` so it reads through the tray from any angle. That
-  overlay was replaced in Sept 2026 by a wall-top label plus a half-coverage preview of
-  the future tray, and restored (on the floor again) by request in Oct 2026 — the preview
-  meshed a second tray on every drag snap and read as clutter. Release clears the grid on
+  *displayed* world's units, so `c0 < 0` after a left grow) is drawn by `SizeGrid`, **flat
+  on the ground** (y 0.6) with `depthTest={false}` so it reads from any angle: a
+  translucent fill and a line per unit boundary over **only the cells the resize adds**,
+  plus the resulting size badge. Only one edge moves per drag, so what is new is a single
+  strip outside the current 0..cols × 0..rows footprint (which of the four bounds left it
+  says where); a shrink adds nothing, so it draws the badge alone and the tray's own ghost
+  carries the message. That overlay was replaced in Sept 2026 by a wall-top label plus a
+  half-coverage preview of the future tray, and restored by request in Oct 2026 — the
+  preview meshed a second tray on every drag snap and read as clutter; the fill under the
+  existing tray went the same day for the same reason. Release clears the grid on
   its own frame and the commit follows on the next one (`requestAnimationFrame`), so a
   big tray's rebuild never shares a frame with the overlay teardown; the camera shift for
   a left/top resize is applied by a layout effect keyed on the geometry identity, i.e. in
