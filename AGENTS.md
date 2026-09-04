@@ -20,7 +20,7 @@ watches a live 3D preview. The whole UI is the 3D view plus two top-left buttons
 Everything is client-side; there is no backend. The preview is meshed **procedurally on
 the main thread** (`lib/trayMesher.ts`, ~3ms for a 3×2) from a shared layout module; the
 CAD kernel only builds the exports (since Sept 2026). Layout changes animate per
-entity — cells settle in / lift out on resize, divider walls burst away on fuse and drop
+entity — cells slide in and out on resize, divider walls burst away on fuse and drop
 in on split — through swappable presets (see "Transitions").
 
 **Stack:** Next.js 16.3 (Turbopack) · TypeScript · Tailwind v4 · Base UI
@@ -267,17 +267,22 @@ floor and the preview just lowers the floor.
   wall a grow turns into a divider). Cells get `cellIn`/`cellOut` with the wave delays
   (nearest-first growing, farthest-first shrinking, 0.35 ripple along the edge, ≤180ms
   stagger, 2400ms budget); each entity also gets a unit `dir` away from the change's
-  center and a `seed`. `end` = latest delay + preset duration.
+  center and a `seed`. `duration` = latest delay + preset duration, counted from the
+  moment playback starts (see below), not from the pointer event.
 - **Presets (`lib/animPresets.ts`) — the experimentation surface.** A preset drives a
   plain `Pose` (`x y z` mm, `rx ry rz` rad about the entity's center, `scale`,
   `opacity`, `reveal`) with Motion's imperative `animate()` (the `motion` package; its
   React components and the discontinued 3D package are *not* used). `PRESET_MS` holds
-  the nominal durations; `slowFactor()` (the `window.__animSlow` knob) scales them and
-  every delay at play time. Current set: `cellIn` (30mm above, fading in, settles down —
-  the requested test animation), `cellOut` (the reverse), `fadeIn`/`fadeOut`, `land`
-  (40mm drop, ease-out bounce), `explode` (keyframes up and away along `dir`, tumbling,
-  fading over the second half), `printIn` (the old bed-up reveal, via `reveal`). To try
-  something new: edit numbers here, add a preset, or point `transitions.ts` at another.
+  the nominal durations and `CELL_TRAVEL` / `CELL_TRAVEL_OUT` / `LAND_DROP` the
+  distances (all actively tuned — read them, don't quote them); `slowFactor()` (the
+  `window.__animSlow` knob) scales every duration and delay at play time. Current set:
+  `cellIn` (starts `CELL_TRAVEL` above and transparent, settles onto the tray),
+  `cellOut` (slides `CELL_TRAVEL_OUT` and fades away), `fadeIn`, `fadeOut`, `land`
+  (`LAND_DROP` above, ease-out bounce), `explode` (keyframes up and away along `dir`,
+  tumbling, fading over the second half), `printIn` (the old bed-up reveal, via
+  `reveal`). The two `*Out` presets `prepare` to `GHOST_ALPHA`, not to 1, because the
+  cells they animate were already ghosted while the handle was held. To try something
+  new: edit numbers here, add a preset, or point `transitions.ts` at another.
 - **Playback (Viewer):** the transition is derived *during render* (React's
   adjust-state-from-props pattern) when the `geometry` prop identity changes, so the
   leaving entities and the new geometry land in the same commit. The event that caused
@@ -300,10 +305,13 @@ floor and the preview just lowers the floor.
   in dev mode can stall for hundreds of ms building and uploading everything) delays the
   whole animation instead of eating its opening. `duration` is relative to that moment,
   never to the pointer event.
-- **Shader hooks the presets rely on:** the material is always DoubleSide and discards
-  back faces unless `uReveal < 1` (so a cut-open reveal shows wall insides, and no
-  program compiles when an animation starts); `uReveal` clips above
-  `reveal · uAnimTop`; the ghost uniforms are untouched by entities (`ghost={null}`).
+- **Shader hooks the presets rely on:** `pose.opacity` reaches both materials through
+  alpha-to-coverage, and `pose.reveal` feeds `uReveal`, which clips fragments above
+  `reveal · uAnimTop`. That clip and the back-face discard live behind `#ifdef
+  TRAY_REVEAL`, a second program variant used only by entities whose preset needs it
+  (`revealable`, today just `printIn`) — the static tray and every other entity compile
+  the front-face-only variant with no `discard`, which keeps early depth testing on. The
+  ghost uniforms are untouched by entities (`ghost={null}`).
 - **Dev:** `window.__animSlow = N` stretches every new transition N×; `window.__transition`
   is the live one (null when idle). Screenshots through the devtools bridge land ~3s
   after the request — slow it down to inspect. Synthetic pointer events leave
