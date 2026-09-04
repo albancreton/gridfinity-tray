@@ -20,6 +20,12 @@ export const LAND_STAGGER_MS = 120;
  * twice as late jitters twice as widely) but stops marching in lockstep.
  */
 export const CELL_DELAY_CHAOS = 0.9;
+/**
+ * Random spread of the walls a fuse removes. They all start at delay 0, so
+ * without it they would shiver and burst on exactly the same frames; the
+ * proportional chaos above has nothing to bite on at zero.
+ */
+export const WALL_SCATTER_MS = 160;
 
 export interface EntityAnim {
   id: string;
@@ -275,6 +281,7 @@ export function makeTransition(prev: Snapshot, next: Snapshot, frame: Frame | nu
     const a = hash(i) * Math.PI * 2;
     e.dir = len > 1e-6 ? [(ex - cx) / len, (ez - cz) / len] : [Math.cos(a), Math.sin(a)];
     e.seed = hash(i + 1);
+    if (e.preset === "explode") e.delay += rand(i) * WALL_SCATTER_MS * slow;
   });
 
   let duration = 0;

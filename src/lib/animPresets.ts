@@ -63,15 +63,17 @@ export const SHAKE_SWINGS = 12;
 /** How much the cell shrinks over the shiver (negative swells it instead), and how big it blows up. */
 export const SHAKE_SHRINK = -0.25;
 export const BURST_SCALE = 2;
+/** What `cellOut` and `explode` both last. */
+export const BURST_TOTAL_MS = SHAKE_MS + SHAKE_HOLD_MS + BURST_MS;
 
 /** Nominal durations in ms; the slow-motion knob scales them at play time. */
 export const PRESET_MS = {
   cellIn: 300,
-  cellOut: SHAKE_MS + SHAKE_HOLD_MS + BURST_MS,
+  cellOut: BURST_TOTAL_MS,
   fadeIn: 700,
   fadeOut: 700,
-  land: 1000,
-  explode: 2000,
+  land: 350,
+  explode: BURST_TOTAL_MS,
   printIn: 1300,
 } as const;
 export type PresetName = keyof typeof PRESET_MS;
@@ -86,7 +88,7 @@ export const GHOST_ALPHA = 0.5;
 /** mm a cell travels along the up axis while it fades. */
 export const CELL_TRAVEL = 300;
 /** mm a landing wall drops from. */
-export const LAND_DROP = 200;
+export const LAND_DROP = 100;
 
 /** Dev hook: `window.__animSlow = 6` stretches every animation 6×. */
 export function slowFactor(): number {
@@ -98,37 +100,28 @@ export function slowFactor(): number {
 const secs = (name: PresetName) => (PRESET_MS[name] * slowFactor()) / 1000;
 
 function easeOutBounce(x: number): number {
-  const n1 = 7.5625, d1 = 2.75;
+  const n1 = 12.5625, d1 = 3.15;
   if (x < 1 / d1) return n1 * x * x;
   if (x < 2 / d1) return n1 * (x -= 1.5 / d1) * x + 0.75;
   if (x < 2.5 / d1) return n1 * (x -= 2.25 / d1) * x + 0.9375;
   return n1 * (x -= 2.625 / d1) * x + 0.984375;
 }
 
-export const presets: Record<PresetName, Preset> = {
-  /** A whole cell settles down onto the tray while fading in. */
-  cellIn: {
+/**
+ * Going away as a fuse gone wrong: a lateral shiver that alternates sides and
+ * damps to nothing while the entity swells by SHAKE_SHRINK, a beat of stillness,
+ * then a blow-up to BURST_SCALE and it is gone. One keyframe track — the shiver
+ * stops, the end of the hold, the burst — starting from `alpha`, which is
+ * GHOST_ALPHA for cells already ghosted under a held resize handle and 1 for
+ * walls a fuse removes with no warning.
+ */
+function shiverBurst(alpha: number): Preset {
+  const n = SHAKE_SWINGS;
+  return {
     prepare(pose) {
-      pose.y = CELL_TRAVEL;
-      pose.opacity = 0;
+      pose.opacity = alpha;
     },
     play(pose, ctx) {
-      return animate(pose, { y: 0, opacity: 1 }, { duration: secs("cellIn"), delay: ctx.delay, ease: "easeOut" });
-    },
-  },
-  /**
-   * The reverse, as a fuse gone wrong: a lateral shiver that alternates sides and
-   * damps to nothing while the cell shrinks by SHAKE_SHRINK, a beat of stillness,
-   * then it blows up to BURST_SCALE and is gone. One keyframe track: the shiver
-   * stops, the end of the hold, and the burst.
-   */
-  cellOut: {
-    prepare(pose) {
-      pose.opacity = GHOST_ALPHA;
-    },
-    play(pose, ctx) {
-      const n = SHAKE_SWINGS;
-      const total = SHAKE_MS + SHAKE_HOLD_MS + BURST_MS;
       // Equal swings, alternating sides, each SHAKE_X/n shorter than the last so
       // the shiver dies out at center — then the hold, then the burst. The hold
       // only gets a keyframe when it lasts: two stops at the same time would
@@ -148,17 +141,32 @@ export const presets: Record<PresetName, Preset> = {
         {
           x: [...x, 0],
           scale: [...stops.map(shrink), BURST_SCALE],
-          opacity: [...stops.map(() => GHOST_ALPHA), 0],
+          opacity: [...stops.map(() => alpha), 0],
         },
         {
-          duration: secs("cellOut"),
+          duration: (BURST_TOTAL_MS * slowFactor()) / 1000,
           delay: ctx.delay,
-          times: [...stops, total].map((t) => t / total),
+          times: [...stops, BURST_TOTAL_MS].map((t) => t / BURST_TOTAL_MS),
           ease: [...ease, "easeOut"],
         },
       );
     },
+  };
+}
+
+export const presets: Record<PresetName, Preset> = {
+  /** A whole cell settles down onto the tray while fading in. */
+  cellIn: {
+    prepare(pose) {
+      pose.y = CELL_TRAVEL;
+      pose.opacity = 0;
+    },
+    play(pose, ctx) {
+      return animate(pose, { y: 0, opacity: 1 }, { duration: secs("cellIn"), delay: ctx.delay, ease: "easeOut" });
+    },
   },
+  /** A removed cell, continuing the fade it already had as a resize ghost. */
+  cellOut: shiverBurst(GHOST_ALPHA),
   fadeIn: {
     prepare(pose) {
       pose.opacity = 0;
@@ -189,33 +197,8 @@ export const presets: Record<PresetName, Preset> = {
       );
     },
   },
-  /** A removed wall bursts up and away from the change, tumbling, and fades mid-flight. */
-  explode: {
-    play(pose, ctx) {
-      const [dx, dz] = ctx.dir;
-      const s = ctx.seed;
-      const reach = 25 + 20 * s;
-      const spinX = (s - 0.5) * 2.5;
-      const spinZ = (0.5 - s) * 2;
-      return animate(
-        pose,
-        {
-          x: [0, dx * reach * 0.6, dx * reach],
-          z: [0, dz * reach * 0.6, dz * reach],
-          y: [0, 22 + 16 * s, -12],
-          rx: [0, spinX * 0.5, spinX],
-          rz: [0, spinZ * 0.5, spinZ],
-          opacity: [1, 1, 0],
-        },
-        {
-          duration: secs("explode"),
-          delay: ctx.delay + s * 0.05 * secs("explode"),
-          times: [0, 0.45, 1],
-          ease: ["easeOut", "easeIn"],
-        },
-      );
-    },
-  },
+  /** A wall a fuse removes: the same shiver and burst, from full opacity. */
+  explode: shiverBurst(1),
   /** The earlier look: the entity prints in from the bed up. */
   printIn: {
     prepare(pose) {

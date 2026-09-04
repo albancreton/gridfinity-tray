@@ -20,8 +20,8 @@ watches a live 3D preview. The whole UI is the 3D view plus two top-left buttons
 Everything is client-side; there is no backend. The preview is meshed **procedurally on
 the main thread** (`lib/trayMesher.ts`, ~3ms for a 3×2) from a shared layout module; the
 CAD kernel only builds the exports (since Sept 2026). Layout changes animate per
-entity — cells slide in and out on resize, divider walls burst away on fuse and drop
-in on split — through swappable presets (see "Transitions").
+entity — cells slide in on resize, cells and fused-away divider walls shiver and
+burst, walls drop in on split — through swappable presets (see "Transitions").
 
 **Stack:** Next.js 16.3 (Turbopack) · TypeScript · Tailwind v4 · Base UI
 (`@base-ui/react` — NOT `@base-ui-components/react`, that package doesn't exist) ·
@@ -284,10 +284,12 @@ floor and the preview just lowers the floor.
   fades — `SHAKE_MS`/`SHAKE_HOLD_MS`/`BURST_MS` also set `PRESET_MS.cellOut`, and
   a zero hold drops its keyframe rather than emitting two stops at one time),
   `fadeIn`, `fadeOut`, `land`
-  (`LAND_DROP` above, ease-out bounce), `explode` (keyframes up and away along `dir`,
-  tumbling, fading over the second half), `printIn` (the old bed-up reveal, via
-  `reveal`). The two `*Out` presets `prepare` to `GHOST_ALPHA`, not to 1, because the
-  cells they animate were already ghosted while the handle was held. To try something
+  (`LAND_DROP` above, ease-out bounce), `explode` (the same `shiverBurst` motion as
+  `cellOut`, from full opacity — the walls a fuse removes were never ghosted;
+  `WALL_SCATTER_MS` in `transitions.ts` spreads their starts, which all sit at delay
+  0), `printIn` (the old bed-up reveal, via `reveal`). `cellOut` and `fadeOut`
+  `prepare` to `GHOST_ALPHA`, not to 1, because the cells they animate were already
+  ghosted while the handle was held. To try something
   new: edit numbers here, add a preset, or point `transitions.ts` at another.
 - **Playback (Viewer):** the transition is derived *during render* (React's
   adjust-state-from-props pattern) when the `geometry` prop identity changes, so the
