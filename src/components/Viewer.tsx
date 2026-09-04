@@ -491,13 +491,17 @@ function ResizeHandles3D({
     const finish = (commit: boolean) => {
       detach();
       if (controls) controls.enabled = true;
-      // The grid goes first, on its own frame; the commit (re-mesh, partition,
-      // entity meshes) follows on the next one, so the two never share a frame. The layout effect above applies the camera shift in the
-      // commit that swaps the geometry.
+      // Both updates in one batch, so a single render swaps the grid, the
+      // geometry and the leaving entities together. Deferring the commit by a
+      // frame (which this used to do) leaves one painted frame showing the old
+      // tray with the ghost already gone — the cells about to be removed flash
+      // back to solid before the animation picks them up at `GHOST_ALPHA`.
+      // Nothing is saved by splitting it: the work is the same, one frame later.
+      // The layout effect above applies the camera shift in that same commit.
       setShadow(null);
       if (commit && !sameFrame(frame, start)) {
         shiftRef.current = { x: -frame.c0 * PITCH, z: -frame.r0 * PITCH };
-        requestAnimationFrame(() => onResize(frame));
+        onResize(frame);
       }
     };
 

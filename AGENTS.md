@@ -72,8 +72,8 @@ attached), not our code: mesh+partition come from the cache in 0.1ms, `makeTrans
 `longtask`), 60fps at 2× on a 3800² canvas idle, dragging with the preview, and animating.
 At 7×7 → 8×7 the dev commit stalls ~750ms while production shows a worst frame gap of
 21ms and one 75ms task per drag snap (the preview's mesh). What is done regardless: the
-resize commit is deferred one frame after the ghost/preview is dropped (`finish` →
-`requestAnimationFrame`); `buildTrayParts` memoizes the last 8 specs so the drag
+ghost and the commit land in **one** React batch (see the drag flow); `buildTrayParts`
+memoizes the last 8 specs so the drag
 preview's build is reused at commit, and partitions **lazily** (`parts` is a getter —
 only a transition needs it, so the drag pays for the mesh alone and the idle tray draws
 the mesher's own, smaller soup); animations start on the second frame after the scene is
@@ -153,9 +153,12 @@ floor and the preview just lowers the floor.
   carries the message. That overlay was replaced in Sept 2026 by a wall-top label plus a
   half-coverage preview of the future tray, and restored by request in Oct 2026 — the
   preview meshed a second tray on every drag snap and read as clutter; the fill under the
-  existing tray went the same day for the same reason. Release clears the grid on
-  its own frame and the commit follows on the next one (`requestAnimationFrame`), so a
-  big tray's rebuild never shares a frame with the overlay teardown; the camera shift for
+  existing tray went the same day for the same reason. Release clears the grid in
+  the same batch as the commit — clearing the shadow a frame early (which `finish` did for
+  a while) leaves one painted frame of the *old* tray with the ghost already gone, so the
+  cells about to be removed flash back to solid before the animation picks them up at
+  `GHOST_ALPHA`; batching them means the last drag frame stays on screen through the
+  rebuild and the leaving entities appear already faded. The camera shift for
   a left/top resize is applied by a layout effect keyed on the geometry identity, i.e. in
   the commit that swaps the geometry. The state lives in `Viewer` because the tray renders
   from it too: `TrayMesh`'s `ghost` prop feeds `uGhost*` uniforms and fragments **outside**
