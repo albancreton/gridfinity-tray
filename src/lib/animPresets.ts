@@ -99,8 +99,15 @@ export function slowFactor(): number {
 
 const secs = (name: PresetName) => (PRESET_MS[name] * slowFactor()) / 1000;
 
+/**
+ * The canonical bounce. These five numbers are one rigid set — the offsets are
+ * derived for d1 = 2.75, and it is only because 7.5625·(1 − 2.625/2.75)² is
+ * exactly 0.015625 that the last piece closes on 1. Move n1 or d1 and the curve
+ * ends past its target, i.e. the wall settles *below* the tray. For a punchier
+ * landing use `PRESET_MS.land` and `LAND_DROP`.
+ */
 function easeOutBounce(x: number): number {
-  const n1 = 12.5625, d1 = 3.15;
+  const n1 = 7.5625, d1 = 2.75;
   if (x < 1 / d1) return n1 * x * x;
   if (x < 2 / d1) return n1 * (x -= 1.5 / d1) * x + 0.75;
   if (x < 2.5 / d1) return n1 * (x -= 2.25 / d1) * x + 0.9375;
