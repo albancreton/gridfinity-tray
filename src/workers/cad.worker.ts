@@ -1,12 +1,27 @@
 import initOpenCascade from "replicad-opencascadejs";
 import {
   setOC,
+  drawCircle,
+  drawRectangle,
+  drawRoundedRectangle,
+  makeCompound,
   sketchRoundedRectangle,
   makeCylinder,
   type Shape3D,
   type Sketch,
 } from "replicad";
-import { PITCH, BASE_H, type TraySpec, type WorkerRequest, type WorkerResponse } from "../lib/protocol";
+import { PITCH, BASE_H, type TraySpec } from "../lib/protocol";
+import type { WorkerRequest, WorkerResponse } from "../lib/workerProtocol";
+import {
+  BOARD_R,
+  SLOT_CHAMFER,
+  SLOT_H,
+  SLOT_R,
+  SLOT_W,
+  boardSizeMm,
+  slotCentres,
+  type SkadisSpec,
+} from "../lib/skadis";
 import {
   FOOT_RINGS,
   LIP_SOCKET,
@@ -122,10 +137,61 @@ export function buildTray(spec: TraySpec): Shape3D {
   return tray;
 }
 
+/**
+ * One slot as a 2D drawing centred on the origin, grown by `grow` on every side
+ * (`grow = SLOT_CHAMFER` is the mouth, 0 the bore). `drawRoundedRectangle(5, 15,
+ * 2.5)` can't express it — the short sides have zero length and the pen has no
+ * preceding curve to run its tangent arc off — so build the obround from its
+ * straight part plus the two end circles.
+ */
+function slotDrawing(grow: number) {
+  const straight = SLOT_H - SLOT_W; // unchanged by the offset: both ends grow alike
+  return drawRectangle(SLOT_W + 2 * grow, straight)
+    .fuse(drawCircle(SLOT_R + grow).translate(0, straight / 2))
+    .fuse(drawCircle(SLOT_R + grow).translate(0, -straight / 2));
+}
+
+/**
+ * A SKÅDIS board: one extruded plate minus one cut tool per slot, the tool
+ * lofted mouth → bore → bore → mouth so the 1mm chamfer comes out of the same
+ * operation. The outermost rings sit a hair past each face at `c + e`, so the
+ * 45° flank continues through the surface and the mouth is exactly `c` wide
+ * there.
+ *
+ * The tools are cut as **one compound**, not fused first: they are disjoint, so
+ * the fuse only costs time (measured on a 17×27 board, 229 slots — 5s with a
+ * compound against 8.5s via `fuseAll`). Both beat chamfering the finished solid
+ * with `.chamfer()` by a wide margin: that took 55s on the same board, because
+ * OpenCASCADE prices chamfers per edge and there are four per slot.
+ *
+ * Same frame mapping as the tray: plan x → OCC x, plan z → OCC y = d − z.
+ */
+export function buildBoard(spec: SkadisSpec): Shape3D {
+  const { w, d, h } = boardSizeMm(spec);
+  const plate = (
+    drawRoundedRectangle(w, d, BOARD_R).translate(w / 2, d / 2).sketchOnPlane("XY") as Sketch
+  ).extrude(h) as Shape3D;
+
+  const e = 0.01; // overshoot past each face, so the cut leaves no skin
+  const c = spec.chamfer ? Math.min(SLOT_CHAMFER, h / 2 - e) : 0;
+  const bore = slotDrawing(0);
+  const mouth = c > 0 ? slotDrawing(c + e) : bore;
+
+  const tools = slotCentres(spec.cols, spec.rows).map((s) => {
+    const at = (dr: typeof bore, z: number) =>
+      dr.translate(s.x, d - s.z).sketchOnPlane("XY", z) as Sketch;
+    if (c === 0) return at(bore, -e).extrude(h + 2 * e) as Shape3D;
+    return at(mouth, -e).loftWith([at(bore, c), at(bore, h - c), at(mouth, h + e)], {
+      ruled: true,
+    }) as Shape3D;
+  });
+  return tools.length > 0 ? plate.cut(makeCompound(tools) as Shape3D) : plate;
+}
+
 async function handle(req: WorkerRequest): Promise<WorkerResponse> {
   try {
     await init();
-    const tray = buildTray(req.spec);
+    const tray = req.model === "skadis" ? buildBoard(req.spec) : buildTray(req.spec);
     if (req.type === "mesh") {
       const m = tray.mesh({ tolerance: 0.05, angularTolerance: 20 });
       const e = tray.meshEdges({ tolerance: 0.05, angularTolerance: 20 });

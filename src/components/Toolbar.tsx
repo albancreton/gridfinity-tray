@@ -4,11 +4,18 @@ import { NumberField } from "@base-ui/react/number-field";
 import { Popover } from "@base-ui/react/popover";
 import { Switch } from "@base-ui/react/switch";
 import type { TrayParams } from "@/lib/protocol";
+import type { SkadisParams } from "@/lib/skadis";
+import type { ModelKind } from "@/lib/workerProtocol";
 import type { ViewSettings } from "@/lib/viewSettings";
+import { POPUP, TRIGGER } from "./popoverStyles";
 
 interface Props {
+  /** Which generator is on screen; the Settings popover shows that model's params. */
+  model: ModelKind;
   params: TrayParams;
   onChange: (next: TrayParams) => void;
+  board: SkadisParams;
+  onBoardChange: (next: SkadisParams) => void;
   view: ViewSettings;
   onViewChange: (next: ViewSettings) => void;
   onExport: (kind: "stl" | "step") => void;
@@ -85,12 +92,6 @@ function Toggle({
 
 const HEIGHT_PRESETS = [2, 3, 4, 6];
 
-const TRIGGER =
-  "flex items-center gap-2 rounded-full border border-neutral-700 bg-neutral-900/90 px-3.5 py-2 text-sm font-medium text-neutral-200 shadow-lg shadow-black/30 backdrop-blur transition-colors hover:bg-neutral-800 hover:text-white data-[popup-open]:bg-neutral-800 data-[popup-open]:text-white";
-
-const POPUP =
-  "origin-[var(--transform-origin)] rounded-xl border border-neutral-700 bg-neutral-900/95 p-4 shadow-xl shadow-black/40 backdrop-blur transition-[opacity,transform] duration-150 data-[ending-style]:scale-95 data-[ending-style]:opacity-0 data-[starting-style]:scale-95 data-[starting-style]:opacity-0";
-
 function SlidersIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -122,14 +123,18 @@ function DownloadIcon() {
  * itself is sized and fused directly in the 3D view.
  */
 export default function Toolbar({
+  model,
   params,
   onChange,
+  board,
+  onBoardChange,
   view,
   onViewChange,
   onExport,
   exporting,
 }: Props) {
   const set = (patch: Partial<TrayParams>) => onChange({ ...params, ...patch });
+  const setBoard = (patch: Partial<SkadisParams>) => onBoardChange({ ...board, ...patch });
   const setView = (patch: Partial<ViewSettings>) => onViewChange({ ...view, ...patch });
 
   return (
@@ -143,54 +148,75 @@ export default function Toolbar({
           <Popover.Positioner side="bottom" align="start" sideOffset={8}>
             <Popover.Popup className={`${POPUP} w-72`}>
               <div className="flex flex-col gap-3">
-                <Field
-                  label="Height"
-                  value={params.heightMm}
-                  min={7}
-                  max={140}
-                  step={1}
-                  unit="mm"
-                  onValue={(v) => set({ heightMm: v })}
-                />
-                <div className="flex justify-end gap-1.5">
-                  {HEIGHT_PRESETS.map((u) => (
-                    <button
-                      key={u}
-                      className={`rounded px-2 py-0.5 text-xs tabular-nums ${
-                        params.heightMm === u * 7
-                          ? "bg-sky-600 text-white"
-                          : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700"
-                      }`}
-                      onClick={() => set({ heightMm: u * 7 })}
-                    >
-                      {u}u
-                    </button>
-                  ))}
-                </div>
-                <Field
-                  label="Wall thickness"
-                  value={params.wall}
-                  min={0.8}
-                  max={4}
-                  step={0.1}
-                  unit="mm"
-                  onValue={(v) => set({ wall: v })}
-                />
-                <Field
-                  label="Floor thickness"
-                  value={params.floor}
-                  min={0}
-                  max={10}
-                  step={0.2}
-                  unit="mm"
-                  onValue={(v) => set({ floor: v })}
-                />
-                <Toggle label="Stacking lip" checked={params.lip} onChecked={(v) => set({ lip: v })} />
-                <Toggle
-                  label="Magnet holes"
-                  checked={params.magnets}
-                  onChecked={(v) => set({ magnets: v })}
-                />
+                {model === "skadis" ? (
+                  <>
+                    <Field
+                      label="Thickness"
+                      value={board.thickness}
+                      min={2}
+                      max={12}
+                      step={0.2}
+                      unit="mm"
+                      onValue={(v) => setBoard({ thickness: v })}
+                    />
+                    <Toggle
+                      label="Slot edge chamfer"
+                      checked={board.chamfer}
+                      onChecked={(v) => setBoard({ chamfer: v })}
+                    />
+                  </>
+                ) : (
+                  <>
+                  <Field
+                    label="Height"
+                    value={params.heightMm}
+                    min={7}
+                    max={140}
+                    step={1}
+                    unit="mm"
+                    onValue={(v) => set({ heightMm: v })}
+                  />
+                  <div className="flex justify-end gap-1.5">
+                    {HEIGHT_PRESETS.map((u) => (
+                      <button
+                        key={u}
+                        className={`rounded px-2 py-0.5 text-xs tabular-nums ${
+                          params.heightMm === u * 7
+                            ? "bg-sky-600 text-white"
+                            : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700"
+                        }`}
+                        onClick={() => set({ heightMm: u * 7 })}
+                      >
+                        {u}u
+                      </button>
+                    ))}
+                  </div>
+                  <Field
+                    label="Wall thickness"
+                    value={params.wall}
+                    min={0.8}
+                    max={4}
+                    step={0.1}
+                    unit="mm"
+                    onValue={(v) => set({ wall: v })}
+                  />
+                  <Field
+                    label="Floor thickness"
+                    value={params.floor}
+                    min={0}
+                    max={10}
+                    step={0.2}
+                    unit="mm"
+                    onValue={(v) => set({ floor: v })}
+                  />
+                  <Toggle label="Stacking lip" checked={params.lip} onChecked={(v) => set({ lip: v })} />
+                  <Toggle
+                    label="Magnet holes"
+                    checked={params.magnets}
+                    onChecked={(v) => set({ magnets: v })}
+                  />
+                  </>
+                )}
                 <hr className="border-neutral-800" />
                 <Toggle
                   label="Printed look"

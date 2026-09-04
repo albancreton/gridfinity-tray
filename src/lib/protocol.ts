@@ -1,4 +1,5 @@
-// Shared types between the UI and the CAD worker.
+// The gridfinity tray spec: the constants the UI, the mesher and the CAD
+// worker all derive their dimensions from. See lib/skadis.ts for the board.
 
 // --- Gridfinity spec constants (mm), shared so the UI can derive sizes
 // without asking the worker ---
@@ -49,18 +50,5 @@ export function traySizeMm(spec: Pick<TraySpec, "cols" | "rows" | "heightMm" | "
   };
 }
 
-export interface MeshData {
-  vertices: Float32Array;
-  triangles: Uint32Array;
-  /** Edge polylines, flat [x,y,z,x,y,z,...] pairs forming line segments. */
-  edges: Float32Array;
-}
-
-export type WorkerRequest =
-  | { id: number; type: "mesh"; spec: TraySpec }
-  | { id: number; type: "stl" | "step"; spec: TraySpec };
-
-export type WorkerResponse =
-  | { id: number; ok: true; type: "mesh"; mesh: MeshData }
-  | { id: number; ok: true; type: "stl" | "step"; file: ArrayBuffer }
-  | { id: number; ok: false; error: string };
+// The worker messages moved to lib/workerProtocol.ts when the CAD worker gained
+// a second model to build; this file is the gridfinity tray's spec alone.

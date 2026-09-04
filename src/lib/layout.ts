@@ -7,15 +7,12 @@
 // plan z to its own y (see cad.worker.ts).
 
 import { BASE_H, CLEAR, LIP_H, PITCH, R_OUT, type Region, type TraySpec } from "./protocol";
+import { insetRRect, type RRect } from "./meshKit";
 
-/** Axis-aligned rounded rectangle in plan coordinates. */
-export interface RRect {
-  x0: number;
-  z0: number;
-  x1: number;
-  z1: number;
-  r: number;
-}
+// The rounded-rectangle primitive is shared with the board layout, so it lives
+// in meshKit now; re-exported here because every tray consumer imports it from
+// this module.
+export { insetRRect, type RRect };
 
 export interface Levels {
   /** Top of the outer wall (rim), lip included. */
@@ -36,17 +33,6 @@ export function levels(spec: Pick<TraySpec, "heightMm" | "lip" | "floor">): Leve
 /** Outer outline of the tray: the grid footprint minus the 0.25mm clearance. */
 export function outerOutline(cols: number, rows: number): RRect {
   return { x0: CLEAR, z0: CLEAR, x1: PITCH * cols - CLEAR, z1: PITCH * rows - CLEAR, r: R_OUT };
-}
-
-/** `rr` shrunk by `inset` on every side; the corner stays concentric. */
-export function insetRRect(rr: RRect, inset: number): RRect {
-  return {
-    x0: rr.x0 + inset,
-    z0: rr.z0 + inset,
-    x1: rr.x1 - inset,
-    z1: rr.z1 - inset,
-    r: Math.max(0, rr.r - inset),
-  };
 }
 
 /**

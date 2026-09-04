@@ -8,20 +8,35 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 
 <!-- END:nextjs-agent-rules -->
 
-# Gridfinity Tray Builder
+# Gridfinity Tray & SKÅDIS Board Builder
 
-Visual web app to design [gridfinity](https://gridfinity.xyz) trays and export them as
-**binary STL** and **real STEP** (ISO-10303-21). The user sizes a grid of 42mm units by
-dragging the 3D handles (max 12×12), selects cells in the 3D view and **fuses**
-them into larger compartments
-(spreadsheet-style cell merging), tweaks parameters in a floating Settings popover, and
-watches a live 3D preview. The whole UI is the 3D view plus two top-left buttons
-(Settings, Export); the former sidebar and 2D grid editor were removed in Sept 2026.
-Everything is client-side; there is no backend. The preview is meshed **procedurally on
-the main thread** (`lib/trayMesher.ts`, ~3ms for a 3×2) from a shared layout module; the
-CAD kernel only builds the exports (since Sept 2026). Layout changes animate per
-entity — cells slide in on resize, cells and fused-away divider walls shiver and
-burst, walls drop in on split — through swappable presets (see "Transitions").
+Visual web app that designs two printable things and exports either as **binary STL** or
+**real STEP** (ISO-10303-21). A popover at the **top right** switches between them; the
+rest of the UI is the 3D view plus the Settings/Export buttons at the top left.
+
+**Gridfinity trays** (the original): size a grid of 42mm units by dragging the 3D handles
+(max 12×12), select cells in the 3D view and **fuse** them into larger compartments
+(spreadsheet-style cell merging), tweak parameters in the Settings popover. The former
+sidebar and 2D grid editor were removed in Sept 2026. Layout changes animate per entity —
+cells slide in on resize, cells and fused-away divider walls shiver and burst, walls drop
+in on split — through swappable presets (see "Transitions").
+
+**IKEA SKÅDIS boards** (added Sept 2026): far simpler, because a board has no
+compartments. The only edit is dragging an edge to add or remove lattice columns and rows,
+which must stay **odd** (3, 5, 7 …), so the handles step by two. No cell selection, no
+fusing, no transitions — but the same printed look, the same ghost preview while dragging,
+and the same export path.
+
+Everything is client-side; there is no backend. Both previews are meshed **procedurally on
+the main thread** (`lib/trayMesher.ts` ~3ms for a 3×2, `lib/boardMesher.ts` ~15ms for the
+largest real board) from shared layout modules; the CAD kernel only builds the exports
+(since Sept 2026).
+
+**What the two share** — this is the point of the split, so prefer extending these over
+forking them: `lib/meshKit.ts` (mesh primitives), `lib/printShader.ts` (the printed-look
+GLSL), `lib/gridMetrics.ts` + `components/viewer/handles.tsx` (the resize handles),
+`components/viewer/scene.tsx` (controls, lights, ground, camera pose), the CAD worker and
+its `Job` protocol.
 
 **Stack:** Next.js 16.3 (Turbopack) · TypeScript · Tailwind v4 · Base UI
 (`@base-ui/react` — NOT `@base-ui-components/react`, that package doesn't exist) ·
@@ -61,20 +76,30 @@ Node 24 — a warning, not a failure.
 
 | File | Role |
 |---|---|
-| `src/app/page.tsx` | State owner: `GridState` + `TrayParams` → `TraySpec` → `buildTrayParts(spec)` in a `useMemo` (synchronous, no debounce); plus render-only `ViewSettings`; localStorage persistence (`gridfinity-tray-v1`); export handler (the only worker call); size readout |
-| `src/components/Toolbar.tsx` | Floating top-left buttons (Base UI `Popover`): Settings (params, printed look, layer height, dev-only CAD overlay toggle) and Export (STL / STEP) |
-| `src/components/Viewer.tsx` | R3F canvas: `TrayMesh` (uploads flat-shaded triangles + edge lines; selection-tint, ghost, reveal and printed-look shader patches; applies an animation `pose`), `EntityMesh` + `TransitionEnd` (animation playback), `CadOverlay` (dev builds: the worker's B-rep edges in red + `window.__compare()`), `ResizeHandles3D` (four edge handles + `SizeGrid`, the ground footprint overlay; commit on release, camera compensation for left/top resizes), `MappedControls` (view controls; sets the one-time initial orbit target) |
+| `src/app/page.tsx` | State owner for **both** models: `model: ModelKind`, `GridState` + `TrayParams` → `TraySpec` → `buildTrayParts(spec)` in a `useMemo` (synchronous, no debounce), and `SkadisState` + `SkadisParams` → `SkadisSpec`; plus render-only `ViewSettings`; localStorage persistence (one key, `gridfinity-tray-v1`, with defaults spread over it so an older save restores); export handler (the only worker call); size readout |
+| `src/components/ModelSwitcher.tsx` | Top-right popover switching tray ↔ board. Switching remounts the canvas, which reframes the camera |
+| `src/components/Toolbar.tsx` | Floating top-left buttons (Base UI `Popover`): Settings — the **active model's** params, then printed look, layer height and the dev-only CAD overlay toggle — and Export (STL / STEP). Popover chrome is in `popoverStyles.ts`, shared with the switcher |
+| `src/components/Viewer.tsx` | The **tray's** R3F canvas: `TrayMesh` (uploads flat-shaded triangles + edge lines; selection-tint, ghost, reveal and printed-look shader patches; applies an animation `pose`), `CellSelector` + the Fuse/Split popup, `EntityMesh` + `TransitionEnd` (animation playback), `CadOverlay` (dev builds: the worker's B-rep edges in red + `window.__compare()`), and `TRAY_METRICS`. The scene shell and the handles come from `viewer/` |
+| `src/components/BoardViewer.tsx` | The board's R3F canvas — the tray Viewer minus everything a board doesn't have. `BoardMesh` (flat-shaded triangles + edge lines, ghost + printed-look patches, its own analytic `topEdgeDist`), the shared handles with `BOARD_METRICS`, the shared scene shell. No selection, no popup, no transitions |
+| `src/components/viewer/scene.tsx` | Model-agnostic scene: `MappedControls` (view controls; sets the one-time initial orbit target), `SceneLights`, `GroundGrid` (`section` = the model's pitch), `perspectivePose(w, d)` **in mm**, `groundPoint` |
+| `src/components/viewer/handles.tsx` | The four edge handles, written once for both models: `ResizeHandles3D` + `SizeGrid` (the ground footprint overlay) + the hover/drag visuals. Everything model-specific arrives as a `GridMetrics`; commit on release, camera compensation for left/top resizes |
+| `src/lib/gridMetrics.ts` | `GridMetrics` — pitch, origin, `pad` (how far the shape overhangs its outermost unit boundary), and the allowed counts `min`/`max`/`step` — plus `at`/`lo`/`hi`/`unitAt`/`clampCount`. Tray = `{42, 0, 0, 1..12 step 1}`, board = `{20, 10, 10, 3..37 step 2}` |
 | `src/lib/transitions.ts` | Pure diff of two partitioned trays into a `Transition`: entering/leaving `EntityAnim`s (cells with everything that belongs to them, lone walls) with presets, delays and directions |
 | `src/lib/animPresets.ts` | The animation presets (`cellIn`, `explode`, ...): each drives a plain `Pose` with Motion's `animate()`; durations, distances and the slow-motion knob live here |
 | `src/lib/grid.ts` | Pure grid model: `merges: Region[]` (only >1-cell merges stored; uncovered cells are implicit 1×1). `expandSelection` grows a rect over touched merges until stable — spreadsheet semantics. `reframe(state, frame)` re-outlines the grid to a `Frame` (end-exclusive, in the current grid's units, so `c0 < 0` adds columns on the left): merges move with their cells and are clipped at the new bounds |
-| `src/lib/protocol.ts` | Shared types (`TraySpec`, `MeshData`, worker messages) + shared mm constants (incl. `R_OUT`, used by both the worker and the printed-look shader) + `traySizeMm()` |
+| `src/lib/protocol.ts` | The **tray's** spec: `TraySpec`, `Region`, mm constants (incl. `R_OUT`, used by both the worker and the printed-look shader), `traySizeMm()` |
+| `src/lib/workerProtocol.ts` | The UI ↔ worker wire: `ModelKind`, `Job` (`{model, spec}` — the tag picks the builder), `MeshData`, request/response. Separate from `protocol.ts` so it can import both specs without a cycle |
+| `src/lib/skadis.ts` | **The board's `protocol.ts` + `layout.ts` + `grid.ts` in one small file**: the mm constants, `SkadisSpec`, `boardSizeMm`, `boardOutline`, `hasSlot`, `slotCentres`, `slotRRect`, `latticeTile`/`tileField`, `clampBoardUnits`, `reframeBoard` |
 | `src/lib/layout.ts` | **Single source of truth for every dimension**: `levels()` (topZ / floorZ / dividerTop), `outerOutline`, `pocketRect` (insets + corner radius), foot loft rings, magnet centers, the lip socket profile. Plan coordinates = the viewer's world xz (x along columns, z along rows, row 0 at z 0..42); heights in mm above the bed. Used by the worker, the mesher and (by hand-copied #defines) the shader |
+| `src/lib/meshKit.ts` | **Model-agnostic mesh primitives**, the vocabulary both meshers are written in: `RRect` + `insetRRect`, the one `sampleRRect` (and `CORNERS`), `sampleCircle`, the `Buf`/`Sink` triangle sink (`tri`/`quad`/`line`/`fan`/`ringLines`), `fillPolygon` (earcut), `loft` (with `inward` for hole walls), `ringStrip` (flat annulus), `meshVolume`/`meshBounds`. `layout.ts` and `trayMesher.ts` re-export the pieces their old consumers imported |
+| `src/lib/boardMesher.ts` | Procedural preview mesher for the board — fully analytic, no clipping and no triangulator, because the faces pave a lattice: border band (one `ringStrip` between the R8 outline and the plain rect the tiles pave), one 20mm tile per lattice position (a quad, or a `ringStrip` around its slot), slot walls as 4-ring lofts carrying the chamfer, plus the board's own edge. Tile seams carry no edge line. Dev hook `window.__buildBoard` |
+| `src/lib/printShader.ts` | **The printed look, minus what is being printed**: the uniform bag, the vertex/fragment chunks, `sdRoundRect`, the bead profile and two-stage anti-moiré, the ghost + reveal block, and `patchEdgeMaterial`. Each model supplies one `float topEdgeDist(vec2 p, out vec2 away)` and concatenates |
 | `src/lib/trayMesher.ts` | Procedural preview mesher: emits the tray's *exterior faces* directly — no solid booleans. Wall top = a height field of the inset from the outer outline (`topBands`: rim / chamfer / step / chamfer / socket floor, plus `wall` as a boundary), built as ring-quads near the outline and, for the flat divider network, **per cell** (interior cells analytically: a strip per walled side + a cove per walled corner; boundary cells 2D-clipped with `polygon-clipping`); walls hang off the polygons' edges (classified as pocket / outer / iso-ring); pocket floors, feet lofts, magnet pockets and the underside gaps are analytic. Also emits the B-rep-style edge lines and flat normals. Dev hook `window.__buildTray` |
 | `src/lib/trayParts.ts` | **Part partition** of the mesher's soup into animatable entities (`TrayPart`: foot, cell, divider segment, junction post, outer-wall stretch, tray corner), each an exact tile of the tray; `buildTrayParts(spec)` meshes eagerly and partitions **lazily** (`parts` is a getter, so a drag preview pays for the mesh alone); `PartitionedTray` also carries the merged arrays, which is what renders when nothing animates. See "Parts". Dev hook `window.__buildTrayParts` |
 | `src/lib/viewMapping.ts` | Mouse-button → view-action presets (pure data). Active: `"fusion"` (middle=pan, shift+middle=orbit, wheel=zoom, left/right free) |
 | `src/lib/viewSettings.ts` | Render-only settings (`printLook`, `layerHeight`) + defaults. They never reach the worker — a change must not trigger a rebuild |
-| `src/lib/cadClient.ts` | Worker singleton, promise-per-request, `downloadBlob` |
-| `src/workers/cad.worker.ts` | **Export geometry** (and the dev overlay's mesh). `buildTray(spec)` is pure, all numbers from `layout.ts`: feet loft → body extrude → fuse → pocket cuts → lip socket cut → magnet cuts. STL + STEP from the same BRep. Loads its WASM lazily, on the first export |
+| `src/lib/cadClient.ts` | Worker singleton, promise-per-request (takes a `Job`), `downloadBlob` |
+| `src/workers/cad.worker.ts` | **Export geometry** (and the dev overlay's mesh), for both models — one worker, one WASM instance. `buildTray(spec)`: feet loft → body extrude → fuse → pocket cuts → lip socket cut → magnet cuts. `buildBoard(spec)`: plate extrude, minus one lofted tool per slot (mouth → bore → bore → mouth, so the chamfer comes out of the same operation), all cut as **one compound**. Both pure, all numbers from `layout.ts` / `skadis.ts`. STL + STEP from the same BRep. Loads its WASM lazily, on the first export |
 
 **Preview cost** (main thread, per change, mesh + partition): ~6ms at 3×2, ~120ms at
 12×12 with lip + magnets (mesher ~70ms: the per-cell wall tops run edge classification
@@ -128,7 +153,33 @@ floor and the preview just lowers the floor.
   exported *from the live Pages site* is a 3188-triangle binary STL measuring
   41.5 × 41.5 × 25.4, so the deployed WASM kernel is the same one.
 
-## 3D view conventions (Viewer.tsx)
+## SKÅDIS numbers (mm) — in `skadis.ts`
+
+From IKEA's own drawing, cross-checked against the product photo:
+
+- Slot centres on a **20mm lattice**, the outermost **20mm from each board edge**: the
+  centre of `(c, r)` is `(20 + 20c, 20 + 20r)`.
+- A slot exists where **`(c + r)` is odd** — the four corners are **empty** and the outer
+  rows/columns are the sparse ones. (The drawing's own corner has no slot; so does the
+  product photo. Getting this parity backwards is the easy mistake — it still looks like a
+  pegboard.) Same-row slots are therefore 40mm apart, with the interleaved set offset 20/20.
+- **Board = `20·(cols+1)` × `20·(rows+1)` × 5mm** (thickness measured off the real board,
+  adjustable in Settings), outer corners **R8**. That lands the real boards exactly:
+  `17×27 → 360×560`, `27×27 → 560×560`, `37×27 → 760×560`.
+- Slot = vertical obround **5 wide × 15 tall, R2.5**, with the drawing's 1mm edge break cut
+  as a **45° chamfer** (prints better than a fillet, and exact in both the preview and the
+  CAD).
+- Counts are **odd, 3 → 37, step 2**. Odd is what makes the checkerboard symmetric about
+  both axes; the step of 2 is what keeps the slot parity fixed when the board grows from
+  the left or the top.
+- Verified: preview mesher vs CAD kernel agree to **<0.01%** by signed volume across
+  chamfered and unchamfered boards; a 3×3 STL exported in the browser measures exactly
+  80 × 80 × 5, a 17×27 measures 360 × 560 × 5.
+
+## 3D view conventions (Viewer.tsx + viewer/)
+
+Written for the tray, but everything except cell selection now applies to the board too —
+the handles and the scene shell live in `components/viewer/` and read a `GridMetrics`.
 
 - **Corner-anchored world:** the tray's top-left cell corner is pinned to the origin;
   columns grow +x, rows grow +z (row 0 at z 0..42, screen-down when seen from above).
@@ -149,7 +200,7 @@ floor and the preview just lowers the floor.
   the Viewer only once `hydrated`, so that one-time pose frames the *restored* design.
   If a fit-view button is ever wanted, the eased orbit-angle-space flight rig
   (`CameraRig`) is in git history just before that change.
-- **Handle icons:** the four resize handles (one per tray edge) are `assets/resize.svg` (a vertical double
+- **Handle icons** (`viewer/handles.tsx`): the four resize handles (one per tray edge) are `assets/resize.svg` (a vertical double
   chevron) drawn flat on the ground: Next's static import gives the URL, `SVGLoader`
   turns it into one merged `ShapeGeometry` (`useResizeIconGeometry`), rotated so
   SVG-down maps to +z (screen-down when seen from above) and spun per axis (`AXIS_SPIN`).
@@ -162,7 +213,7 @@ floor and the preview just lowers the floor.
   dragging = full size while the others fade out (and stop taking the pointer); all ease
   in `useFrame` (the initial scale/opacity props are stable primitives, so re-renders
   don't snap them). No cursor change on hover — by request.
-- **Handle drag flow:** pointerdown disables controls (a mapping with orbit/pan on the
+- **Handle drag flow** (`viewer/handles.tsx`): pointerdown disables controls (a mapping with orbit/pan on the
   left button must not also move the view); moves use window-level listeners and
   **absolute** snapping — the pointer is raycast onto the ground plane and the dragged
   edge goes to the grid line nearest that point, from any viewing angle, while the
@@ -399,6 +450,26 @@ floor and the preview just lowers the floor.
   worker source as a static asset (`out/_next/static/media/cad.worker.*.ts`), which the
   `**/*.ts` include would then typecheck out of context — `npx tsc --noEmit` fails on
   unresolvable `../lib/*` imports until you delete `out/`. eslint already ignores it.
+- **replicad can't draw the SKÅDIS slot directly.** `drawRoundedRectangle(5, 15, 2.5)`
+  throws "You need a previous curve to sketch a tangent arc": with `r = w/2` the short
+  sides have zero length, so the pen has no curve to run its tangent arc off. The obround
+  is built once from `drawRectangle(5, 10)` fused with two `drawCircle(2.5)`, then
+  `translate`d to each slot.
+- **Chamfering a finished solid is the slow way.** On a 17×27 board (229 slots) measured
+  three ways: `.chamfer()` over the two face planes **55s**; per-slot lofted cut tools
+  fused then cut **8.5s**; the same tools cut as **one `makeCompound`** — no fuse, they are
+  disjoint — **5s**. OpenCASCADE prices chamfers per edge, and there are four per slot.
+  Total export for that board is ~14s (the STL meshing is the other half); a 3×3 is 0.3s.
+- `sampleRRect(rr, 0)` means "the four corners alone" — the `segs || 1` guard exists
+  because `i / segs` was NaN at 0. The board's tile field is a zero-radius rect, so this is
+  the sampling it wants; passing a nonzero `segs` there just makes duplicate points.
 - Removing a drei OrbitControls prop doesn't reset it on HMR — full-reload the page.
   Same for GLSL edits inside `onBeforeCompile`: three keeps the program compiled from
-  the first callback, so the material never picks up the new source without a reload.
+  the first callback, so the material never picks up the new source without a reload —
+  and since `lib/printShader.ts` is now *shared*, an edit there silently affects both
+  models until you reload.
+- **"Change one, change both" pairs**, all of them cross-file by necessity:
+  the tray's `pocketRect` in the shader vs `layout.ts`; `trayTopY`/`floorZ` in Viewer vs
+  `levels()`; the board's slot SDF and `#define`s in `BoardViewer.tsx` vs the constants in
+  `skadis.ts` (they are interpolated from it, so only the *shape* can drift); each model's
+  `GridMetrics` vs its own layout; `GHOST_ALPHA` vs the `cellOut`/`fadeOut` presets.

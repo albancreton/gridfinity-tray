@@ -1,4 +1,4 @@
-import type { MeshData, TraySpec, WorkerRequest, WorkerResponse } from "./protocol";
+import type { Job, MeshData, WorkerRequest, WorkerResponse } from "./workerProtocol";
 
 type Pending = {
   resolve: (res: WorkerResponse) => void;
@@ -24,23 +24,23 @@ function getWorker(): Worker {
   return worker;
 }
 
-function request(type: WorkerRequest["type"], spec: TraySpec): Promise<WorkerResponse> {
+function request(type: WorkerRequest["type"], job: Job): Promise<WorkerResponse> {
   const id = nextId++;
   return new Promise((resolve) => {
     pending.set(id, { resolve });
-    getWorker().postMessage({ id, type, spec } satisfies WorkerRequest);
+    getWorker().postMessage({ id, type, ...job } as WorkerRequest);
   });
 }
 
-export async function requestMesh(spec: TraySpec): Promise<MeshData> {
-  const res = await request("mesh", spec);
+export async function requestMesh(job: Job): Promise<MeshData> {
+  const res = await request("mesh", job);
   if (!res.ok) throw new Error(res.error);
   if (res.type !== "mesh") throw new Error("unexpected response");
   return res.mesh;
 }
 
-export async function requestExport(kind: "stl" | "step", spec: TraySpec): Promise<Blob> {
-  const res = await request(kind, spec);
+export async function requestExport(kind: "stl" | "step", job: Job): Promise<Blob> {
+  const res = await request(kind, job);
   if (!res.ok) throw new Error(res.error);
   if (res.type === "mesh") throw new Error("unexpected response");
   return new Blob([res.file], { type: "application/octet-stream" });

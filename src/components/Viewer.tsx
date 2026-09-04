@@ -1,20 +1,15 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Canvas, useFrame, useLoader, useThree, type ThreeEvent } from "@react-three/fiber";
-import { OrbitControls, Grid, Html, useCursor } from "@react-three/drei";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
+import { useCursor } from "@react-three/drei";
 import * as THREE from "three";
-import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
-import { SVGLoader } from "three/examples/jsm/loaders/SVGLoader.js";
-import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
-import resizeIcon from "../../assets/resize.svg";
 import {
   BASE_H,
   CLEAR,
   LIP_H,
   PITCH,
   R_OUT,
-  type MeshData,
   type Region,
   type TrayParams,
   type TraySpec,
@@ -24,6 +19,7 @@ import { mergeParts, type PartitionedTray, type TrayPart } from "@/lib/trayParts
 import { GHOST_ALPHA, presets, restPose, type Playback, type Pose } from "@/lib/animPresets";
 import { makeTransition, type EntityAnim, type Snapshot, type Transition } from "@/lib/transitions";
 import { requestMesh } from "@/lib/cadClient";
+import type { MeshData } from "@/lib/workerProtocol";
 import {
   type Frame,
   type GridState,
@@ -37,536 +33,48 @@ import {
   regionAt,
   split,
 } from "@/lib/grid";
+import { DEFAULT_MAPPING_ID, getViewMapping } from "@/lib/viewMapping";
 import {
-  DEFAULT_MAPPING_ID,
-  getViewMapping,
-  type MouseButton,
-  type ViewAction,
-} from "@/lib/viewMapping";
-import { NOZZLE_LINE_W, type ViewSettings } from "@/lib/viewSettings";
+  GroundGrid,
+  MappedControls,
+  SceneLights,
+  groundPoint,
+  perspectivePose,
+} from "./viewer/scene";
+import {
+  ResizeHandles3D,
+  type GridMetrics,
+  type ShadowState,
+} from "./viewer/handles";
+import { type ViewSettings } from "@/lib/viewSettings";
+import {
+  FRAG_DECLS,
+  FRAG_GHOST,
+  FRAG_PRINT,
+  REVEAL_DEFINES,
+  VERTEX_BODY,
+  VERTEX_DECLS,
+  patchEdgeMaterial,
+  printUniforms,
+} from "@/lib/printShader";
 
-const ACTION_TO_MOUSE: Record<ViewAction, THREE.MOUSE | undefined> = {
-  orbit: THREE.MOUSE.ROTATE,
-  pan: THREE.MOUSE.PAN,
-  zoom: THREE.MOUSE.DOLLY,
-  none: undefined,
+/**
+ * The tray's unit grid: 42mm cells starting at the origin, 1..12, no overhang —
+ * the outer wall sits on the cell boundary.
+ */
+const TRAY_METRICS: GridMetrics = {
+  pitch: PITCH,
+  origin: 0,
+  pad: 0,
+  min: 1,
+  max: MAX_UNITS,
+  step: 1,
 };
-
-/** OrbitControls with a configurable button→action mapping (see lib/viewMapping). */
-function MappedControls({
-  mappingId,
-  initialTarget,
-}: {
-  mappingId: string;
-  /** Orbit pivot at mount. Must be a stable object: re-applying one would snap the target. */
-  initialTarget: THREE.Vector3;
-}) {
-  const controlsRef = useRef<OrbitControlsImpl>(null);
-  const scene = useThree((s) => s.scene);
-  const mapping = getViewMapping(mappingId);
-
-  const apply = useCallback(
-    (e?: PointerEvent) => {
-      const c = controlsRef.current;
-      if (!c) return;
-      const shift = e?.shiftKey ?? false;
-      // OrbitControls itself swaps orbit<->pan whenever ctrl/meta/shift is held
-      // on the pointer event. Pre-invert those two actions so that after its
-      // swap, the button does exactly what the mapping says.
-      const swapped = e ? e.ctrlKey || e.metaKey || e.shiftKey : false;
-      const resolve = (b: MouseButton) => {
-        let a = (shift ? mapping.shiftButtons?.[b] : undefined) ?? mapping.buttons[b];
-        if (swapped && a === "orbit") a = "pan";
-        else if (swapped && a === "pan") a = "orbit";
-        return ACTION_TO_MOUSE[a];
-      };
-      c.mouseButtons.LEFT = resolve("left");
-      c.mouseButtons.MIDDLE = resolve("middle");
-      c.mouseButtons.RIGHT = resolve("right");
-    },
-    [mapping],
-  );
-
-  useEffect(() => {
-    // The target is set once, imperatively (not as a prop), and then belongs
-    // to the user's pans; a prop would re-apply on every re-render.
-    const c = controlsRef.current;
-    if (c) {
-      c.target.copy(initialTarget);
-      c.update();
-    }
-    if (process.env.NODE_ENV === "development") {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (window as any).__controls = c;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (window as any).__scene = scene;
-    }
-  }, [initialTarget, scene]);
-
-  useEffect(() => {
-    apply();
-    // The action is chosen when the drag starts, so resolve modifiers in a
-    // capture-phase listener that runs before OrbitControls' own handler.
-    const onPointerDown = (e: PointerEvent) => apply(e);
-    window.addEventListener("pointerdown", onPointerDown, true);
-    return () => window.removeEventListener("pointerdown", onPointerDown, true);
-  }, [apply]);
-
-  return (
-    <OrbitControls
-      ref={controlsRef}
-      makeDefault
-      enableZoom={mapping.wheelZoom}
-      // half the default momentum (0.05): keep the ease-out but subtle
-      dampingFactor={0.1}
-    />
-  );
-}
 
 /** Top of the walls, lip included — the worker's `topZ`; keep in sync with cad.worker.ts. */
 function trayTopY(params: TrayParams): number {
   return Math.max(params.heightMm, BASE_H + 1) + (params.lip ? LIP_H : 0);
 }
-
-interface CameraPose {
-  pos: THREE.Vector3;
-  target: THREE.Vector3;
-}
-
-// The tray's top-left cell corner is pinned to the world origin and the grid
-// grows toward +x (columns) and +z (rows), so resizing never shifts what is
-// already there.
-/**
- * Three-quarter view framing a cols×rows tray. Used once, at mount: after that
- * the camera is the user's alone — resizes happen in place, nothing refits.
- */
-function perspectivePose(cols: number, rows: number): CameraPose {
-  const w = cols * PITCH;
-  const d = rows * PITCH;
-  const extent = Math.max(w, d);
-  return {
-    pos: new THREE.Vector3(w / 2 + extent * 1.1, extent * 1.5, d / 2 + extent * 1.9),
-    target: new THREE.Vector3(w / 2, 15, d / 2),
-  };
-}
-
-function groundPoint(ray: THREE.Ray, out: THREE.Vector3): THREE.Vector3 | null {
-  if (Math.abs(ray.direction.y) < 1e-6) return null;
-  const t = -ray.origin.y / ray.direction.y;
-  if (t <= 0) return null;
-  return out.copy(ray.direction).multiplyScalar(t).add(ray.origin);
-}
-
-// --- 3D resize handles -------------------------------------------------------
-
-const HANDLE_GAP = 12; // mm from tray edge to icon center
-const HANDLE_ICON = 16; // icon height in mm (the SVG's 24-unit viewBox maps to this)
-const HANDLE_HIT_LONG = 36; // hit box extent along the edge the handle sits on
-const HANDLE_HIT_SHORT = 20;
-const HANDLE_HIT_H = 10;
-const HANDLE_REST_SCALE = 0.5;
-const HANDLE_REST_OPACITY = 0.5;
-const HANDLE_REST_Y = 0.25; // just above the ground grid
-const HANDLE_HOVER_Y = 3; // mm the icon lifts while hovered or dragged
-const RESIZE_ICON_URL: string = resizeIcon.src;
-
-/** Which tray edge a handle drags. */
-type Side = "left" | "right" | "top" | "bottom";
-const SIDES: readonly Side[] = ["left", "right", "top", "bottom"];
-/** Left/right edges move along x; top/bottom along z. */
-const alongX = (side: Side) => side === "left" || side === "right";
-
-const sameFrame = (a: Frame, b: Frame) =>
-  a.c0 === b.c0 && a.r0 === b.r0 && a.c1 === b.c1 && a.r1 === b.r1;
-
-/**
- * A pending footprint in unit coordinates of the world *as displayed*
- * (end-exclusive; the tray on screen always spans 0..cols × 0..rows). Dragging
- * the left/top edge makes c0/r0 negative (growing) or positive (shrinking).
- */
-interface ShadowState extends Frame {
-  side: Side;
-}
-
-/**
- * resize.svg's two chevrons as one flat geometry: centred, `HANDLE_ICON` tall,
- * lying on the ground with SVG-down mapped to +z — the direction rows grow
- * (screen-down when looking from above), so the chevrons read the way the tray grows.
- */
-function useResizeIconGeometry(): THREE.BufferGeometry {
-  const { paths } = useLoader(SVGLoader, RESIZE_ICON_URL);
-  const geometry = useMemo(() => {
-    const parts = paths.flatMap((p) => p.toShapes().map((s) => new THREE.ShapeGeometry(s)));
-    const merged = mergeGeometries(parts) ?? new THREE.BufferGeometry();
-    parts.forEach((p) => p.dispose());
-    const k = HANDLE_ICON / 24;
-    merged.translate(-12, -12, 0).scale(k, k, 1).rotateX(Math.PI / 2);
-    return merged;
-  }, [paths]);
-  useEffect(() => () => geometry.dispose(), [geometry]);
-  return geometry;
-}
-
-/**
- * One handle's chevrons. At rest: half size, half opacity, on the ground. Hover:
- * full opacity and a small lift. In use (dragging): full size, and the other
- * handles fade out (`dimmed`). All ease over ~100ms in the frame loop; the
- * initial props are stable primitives so re-renders never snap them.
- */
-function HandleIcon({
-  side,
-  hover,
-  active,
-  dimmed,
-}: {
-  side: Side;
-  hover: boolean;
-  active: boolean;
-  dimmed: boolean;
-}) {
-  const geometry = useResizeIconGeometry();
-  const meshRef = useRef<THREE.Mesh>(null);
-  const matRef = useRef<THREE.MeshBasicMaterial>(null);
-  const targetScale = active ? 1 : HANDLE_REST_SCALE;
-  const targetOpacity = dimmed ? 0 : hover || active ? 1 : HANDLE_REST_OPACITY;
-  const targetY = hover || active ? HANDLE_HOVER_Y : HANDLE_REST_Y;
-  useFrame((_, dt) => {
-    const m = meshRef.current;
-    const mat = matRef.current;
-    if (!m || !mat) return;
-    const k = 1 - Math.exp(-dt * 18);
-    m.scale.setScalar(THREE.MathUtils.lerp(m.scale.x, targetScale, k));
-    mat.opacity = THREE.MathUtils.lerp(mat.opacity, targetOpacity, k);
-    m.position.y = THREE.MathUtils.lerp(m.position.y, targetY, k);
-  });
-  return (
-    <mesh
-      ref={meshRef}
-      geometry={geometry}
-      position-y={HANDLE_REST_Y}
-      // spin so the double chevron points along the axis this edge moves on
-      rotation-y={alongX(side) ? Math.PI / 2 : 0}
-      scale={HANDLE_REST_SCALE}
-      raycast={() => null}
-      renderOrder={5}
-    >
-      <meshBasicMaterial
-        ref={matRef}
-        color="#e4e4e7"
-        transparent
-        opacity={HANDLE_REST_OPACITY}
-        side={THREE.DoubleSide}
-        depthWrite={false}
-      />
-    </mesh>
-  );
-}
-
-function Handle({
-  x,
-  z,
-  side,
-  active,
-  dimmed,
-  trayRef,
-  onDown,
-}: {
-  x: number;
-  z: number;
-  side: Side;
-  active: boolean;
-  /** Another handle is in use: fade out and stop taking the pointer. */
-  dimmed: boolean;
-  trayRef: React.RefObject<THREE.Mesh | null>;
-  onDown: (side: Side, e: ThreeEvent<PointerEvent>) => void;
-}) {
-  const [hover, setHover] = useState(false);
-  const hx = alongX(side) ? HANDLE_HIT_SHORT : HANDLE_HIT_LONG;
-  const hz = alongX(side) ? HANDLE_HIT_LONG : HANDLE_HIT_SHORT;
-  // The tray mesh has no pointer handlers, so R3F raycasts straight through it
-  // to the hit box: a handle hidden behind the tray would still hover and grab
-  // clicks. Check the event's own ray against the tray and ignore covered hits
-  // (the click then falls through to the cell selector, as the user sees it).
-  const covered = (e: ThreeEvent<PointerEvent>) => {
-    const tray = trayRef.current;
-    if (!tray) return false;
-    const first = new THREE.Raycaster(e.ray.origin, e.ray.direction).intersectObject(tray, false)[0];
-    return first !== undefined && first.distance < e.distance;
-  };
-  return (
-    <group position={[x, 0, z]}>
-      {/* oversized invisible hit box so the flat icon is easy to grab */}
-      <mesh
-        position-y={HANDLE_HIT_H / 2}
-        visible={!dimmed}
-        onPointerDown={(e) => {
-          if (!covered(e)) onDown(side, e);
-        }}
-        onPointerOver={(e) => {
-          if (covered(e)) return;
-          e.stopPropagation();
-          setHover(true);
-        }}
-        onPointerMove={(e) => setHover(!covered(e))}
-        onPointerOut={() => setHover(false)}
-      >
-        <boxGeometry args={[hx, HANDLE_HIT_H, hz]} />
-        <meshBasicMaterial transparent opacity={0} depthWrite={false} />
-      </mesh>
-      <Suspense fallback={null}>
-        <HandleIcon side={side} hover={hover && !dimmed} active={active} dimmed={dimmed} />
-      </Suspense>
-    </group>
-  );
-}
-
-/**
- * Ghost footprint of the pending size — fill + unit gridlines + size badge —
- * floating at the top of the walls (`y`), where it reads as the tray's new
- * outline rather than a mark on the ground.
- */
-/**
- * The cells a resize would **add**, flat on the ground: a translucent fill, a
- * line per unit boundary, plus the resulting size badge. Only one edge moves
- * per drag, so what is new is a single strip outside the current footprint —
- * nothing is drawn under the tray that is already there. A shrink adds nothing,
- * so only the badge shows; what it removes is ghosted on the tray itself.
- * Drawn without depth testing, so the strip reads from any angle.
- */
-function SizeGrid({ c0, r0, c1, r1, cols, rows }: Frame & { cols: number; rows: number }) {
-  const { lines, box } = useMemo(() => {
-    const added: Frame | null =
-      c1 > cols
-        ? { c0: cols, r0, c1, r1 }
-        : c0 < 0
-          ? { c0, r0, c1: 0, r1 }
-          : r1 > rows
-            ? { c0, r0: rows, c1, r1 }
-            : r0 < 0
-              ? { c0, r0, c1, r1: 0 }
-              : null;
-    const pts: number[] = [];
-    if (added) {
-      for (let c = added.c0; c <= added.c1; c++) {
-        pts.push(c * PITCH, 0, added.r0 * PITCH, c * PITCH, 0, added.r1 * PITCH);
-      }
-      for (let r = added.r0; r <= added.r1; r++) {
-        pts.push(added.c0 * PITCH, 0, r * PITCH, added.c1 * PITCH, 0, r * PITCH);
-      }
-    }
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pts), 3));
-    return { lines: g, box: added };
-  }, [c0, r0, c1, r1, cols, rows]);
-  useEffect(() => () => lines.dispose(), [lines]);
-  return (
-    <group position={[0, 0.6, 0]}>
-      {box && (
-        <>
-          <mesh
-            position={[((box.c0 + box.c1) * PITCH) / 2, 0, ((box.r0 + box.r1) * PITCH) / 2]}
-            rotation={[-Math.PI / 2, 0, 0]}
-            renderOrder={10}
-          >
-            <planeGeometry args={[(box.c1 - box.c0) * PITCH, (box.r1 - box.r0) * PITCH]} />
-            <meshBasicMaterial
-              color="#38bdf8"
-              transparent
-              opacity={0.14}
-              depthTest={false}
-              depthWrite={false}
-            />
-          </mesh>
-          <lineSegments geometry={lines} renderOrder={11}>
-            <lineBasicMaterial color="#7dd3fc" transparent opacity={0.8} depthTest={false} />
-          </lineSegments>
-        </>
-      )}
-      <Html position={[c1 * PITCH + 14, 0, r1 * PITCH + 14]} center style={{ pointerEvents: "none" }}>
-        <div className="rounded-md bg-sky-500 px-2 py-0.5 text-xs font-semibold whitespace-nowrap text-white tabular-nums">
-          {c1 - c0} × {r1 - r0}
-        </div>
-      </Html>
-    </group>
-  );
-}
-
-/**
- * Four grid-resize handles, one per tray edge. Dragging one previews the new
- * footprint as a ground shadow from whatever view the user is in; releasing
- * commits it in one rebuild. The tray on screen always has its cell (0,0) at
- * the world origin (the worker re-anchors there), so after a left/top resize
- * the surviving cells move in world space when the new mesh lands — the camera
- * is translated by the same amount in that same commit, so nothing shifts on
- * screen (the ground grid is 42mm-periodic, so it doesn't give it away either).
- */
-function ResizeHandles3D({
-  cols,
-  rows,
-  geometry,
-  trayRef,
-  shadow: visible,
-  setShadow,
-  onResize,
-}: {
-  cols: number;
-  rows: number;
-  /** The displayed tray; its identity marks when a resize's geometry has landed. */
-  geometry: TrayGeometry;
-  /** The visible tray mesh, so handles it covers ignore the pointer. */
-  trayRef: React.RefObject<THREE.Mesh | null>;
-  /** The shadow currently shown (live, or committed and waiting); Viewer owns it. */
-  shadow: ShadowState | null;
-  setShadow: (s: ShadowState | null) => void;
-  /** Commit a new footprint, in the current grid's unit coordinates. */
-  onResize: (frame: Frame) => void;
-}) {
-  const camera = useThree((s) => s.camera) as THREE.PerspectiveCamera;
-  const gl = useThree((s) => s.gl);
-  // Fetch controls lazily at event time (never from render) so we can toggle
-  // `enabled` without fighting the hooks immutability rule or stale closures.
-  const getState = useThree((s) => s.get);
-  const detachRef = useRef<(() => void) | null>(null);
-  // Camera translation (mm) owed once the rebuilt mesh lands: how far the
-  // surviving cells move when the new origin takes over.
-  const shiftRef = useRef({ x: 0, z: 0 });
-
-  useEffect(() => () => detachRef.current?.(), []);
-
-  // Layout effect: same commit as the geometry swap, before the next frame.
-  useLayoutEffect(() => {
-    const s = shiftRef.current;
-    if (s.x === 0 && s.z === 0) return;
-    const { camera: cam, controls } = getState();
-    cam.position.x += s.x;
-    cam.position.z += s.z;
-    const c = controls as unknown as OrbitControlsImpl | null;
-    if (c) {
-      c.target.x += s.x;
-      c.target.z += s.z;
-    }
-    s.x = 0;
-    s.z = 0;
-  }, [geometry, getState]);
-
-  const beginDrag = (side: Side, e: ThreeEvent<PointerEvent>) => {
-    if (detachRef.current || e.nativeEvent.button !== 0) return;
-    e.stopPropagation();
-    const start: Frame = { c0: 0, r0: 0, c1: cols, r1: rows };
-    const frame: Frame = { ...start };
-    const controls = getState().controls as unknown as OrbitControlsImpl | null;
-    // Mappings that put orbit/pan on the left button must not also move the view.
-    if (controls) controls.enabled = false;
-    setShadow({ ...start, side });
-
-    const raycaster = new THREE.Raycaster();
-    const ndc = new THREE.Vector2();
-    const hit = new THREE.Vector3();
-    const dom = gl.domElement;
-    const { clamp } = THREE.MathUtils;
-
-    const move = (ev: PointerEvent) => {
-      if (ev.pointerId !== e.pointerId) return;
-      const rect = dom.getBoundingClientRect();
-      ndc.set(
-        ((ev.clientX - rect.left) / rect.width) * 2 - 1,
-        -((ev.clientY - rect.top) / rect.height) * 2 + 1,
-      );
-      raycaster.setFromCamera(ndc, camera);
-      if (!groundPoint(raycaster.ray, hit)) return;
-      // Absolute mapping: the dragged edge snaps to the grid line nearest the
-      // pointer's point on the ground plane, whatever the viewing angle. The
-      // opposite edge stays put and the size is kept within 1..MAX_UNITS.
-      const u = Math.round((alongX(side) ? hit.x : hit.z) / PITCH);
-      const next: Frame = { ...start };
-      if (side === "right") next.c1 = clamp(u, 1, MAX_UNITS);
-      else if (side === "left") next.c0 = clamp(u, cols - MAX_UNITS, cols - 1);
-      else if (side === "bottom") next.r1 = clamp(u, 1, MAX_UNITS);
-      else next.r0 = clamp(u, rows - MAX_UNITS, rows - 1);
-      if (sameFrame(next, frame)) return;
-      Object.assign(frame, next);
-      setShadow({ ...next, side });
-    };
-
-    const finish = (commit: boolean) => {
-      detach();
-      if (controls) controls.enabled = true;
-      // Both updates in one batch, so a single render swaps the grid, the
-      // geometry and the leaving entities together. Deferring the commit by a
-      // frame (which this used to do) leaves one painted frame showing the old
-      // tray with the ghost already gone — the cells about to be removed flash
-      // back to solid before the animation picks them up at `GHOST_ALPHA`.
-      // Nothing is saved by splitting it: the work is the same, one frame later.
-      // The layout effect above applies the camera shift in that same commit.
-      setShadow(null);
-      if (commit && !sameFrame(frame, start)) {
-        shiftRef.current = { x: -frame.c0 * PITCH, z: -frame.r0 * PITCH };
-        onResize(frame);
-      }
-    };
-
-    const up = (ev: PointerEvent) => {
-      if (ev.pointerId === e.pointerId) finish(true);
-    };
-    const key = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") finish(false);
-    };
-    const detach = () => {
-      detachRef.current = null;
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      window.removeEventListener("pointercancel", up);
-      window.removeEventListener("keydown", key);
-    };
-    detachRef.current = detach;
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
-    window.addEventListener("pointercancel", up);
-    window.addEventListener("keydown", key);
-  };
-
-  // Handles follow the shadow (still in the displayed world's frame after a
-  // commit, until the new mesh lands) or hug the tray.
-  const f: Frame = visible ?? { c0: 0, r0: 0, c1: cols, r1: rows };
-  const x0 = f.c0 * PITCH;
-  const x1 = f.c1 * PITCH;
-  const z0 = f.r0 * PITCH;
-  const z1 = f.r1 * PITCH;
-  const at: Record<Side, [number, number]> = {
-    left: [x0 - HANDLE_GAP, (z0 + z1) / 2],
-    right: [x1 + HANDLE_GAP, (z0 + z1) / 2],
-    top: [(x0 + x1) / 2, z0 - HANDLE_GAP],
-    bottom: [(x0 + x1) / 2, z1 + HANDLE_GAP],
-  };
-
-  return (
-    <group>
-      {visible && (
-        <SizeGrid
-          c0={visible.c0}
-          r0={visible.r0}
-          c1={visible.c1}
-          r1={visible.r1}
-          cols={cols}
-          rows={rows}
-        />
-      )}
-      {SIDES.map((side) => (
-        <Handle
-          key={side}
-          x={at[side][0]}
-          z={at[side][1]}
-          side={side}
-          active={visible?.side === side}
-          dimmed={visible !== null && visible.side !== side}
-          trayRef={trayRef}
-          onDown={beginDrag}
-        />
-      ))}
-    </group>
-  );
-}
-
 // --- 3D cell selection -------------------------------------------------------
 
 /**
@@ -789,9 +297,6 @@ function makeRegionTexture(): THREE.DataTexture {
  * returns to the flat look instead of moiré. Geometry is untouched (OCC emits
  * two triangles per flat face), so this must stay per-fragment.
  */
-/** `STANDARD` is MeshStandardMaterial's own define; replacing `defines` must keep it. */
-const REVEAL_DEFINES = { STANDARD: "", TRAY_REVEAL: "" };
-
 function TrayMesh({
   geometry: tray,
   sel,
@@ -822,34 +327,14 @@ function TrayMesh({
   pickRef?: React.Ref<THREE.Mesh>;
 }) {
   const uniforms = useRef({
+    ...printUniforms(GHOST_ALPHA),
     uSelMin: { value: new THREE.Vector3() },
     uSelMax: { value: new THREE.Vector3() },
     uSelActive: { value: 0 },
-    uGhostOn: { value: 0 },
-    /** Ghost box in world xz; fragments outside it fade to `uGhostAlpha`. */
-    uGhostMin: { value: new THREE.Vector2() },
-    uGhostMax: { value: new THREE.Vector2() },
-    uGhostAlpha: { value: GHOST_ALPHA },
-    /** Fraction of the tray height that exists yet (the print-in reveal); 1 = whole. */
-    uReveal: { value: 1 },
-    /** Height a fully revealed tray reaches (a hair above the rim). */
-    uAnimTop: { value: 0 },
-    /** Tray-local origin of this geometry (entities are re-based at their center). */
-    uLocalOrigin: { value: new THREE.Vector3() },
-    uPrint: { value: 0 },
-    uLayerH: { value: 0.2 },
-    uLineW: { value: NOZZLE_LINE_W },
-    uFillAngle: { value: Math.PI / 4 },
-    /** Bead relief as a fraction of its period; drives the normal tilt. */
-    uRelief: { value: 0.22 },
-    /** How much darker a seam gets than a bead crest. */
-    uSeamShade: { value: 0.28 },
     /** 12×12 cell → compartment rect (c0, r0, c1, r1) as bytes; see the grid effect. */
     uRegions: { value: makeRegionTexture() },
     uGrid: { value: new THREE.Vector2(1, 1) },
     uWall: { value: 1.2 },
-    /** Perimeter loops drawn around each flat top region before the fill starts. */
-    uPerims: { value: 2 },
   });
   useEffect(() => {
     const regions = uniforms.current.uRegions.value;
@@ -942,62 +427,22 @@ function TrayMesh({
     (shader: Parameters<THREE.MeshStandardMaterial["onBeforeCompile"]>[0]) => {
       Object.assign(shader.uniforms, uniforms.current);
       shader.vertexShader = shader.vertexShader
-        .replace(
-          "#include <common>",
-          "#include <common>\nvarying vec3 vWorldPos;\nvarying vec3 vLocalPos;\nvarying vec3 vWorldNormal;\nuniform vec3 uLocalOrigin;",
-        )
-        .replace(
-          "#include <worldpos_vertex>",
-          "#include <worldpos_vertex>\n" +
-            "vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;\n" +
-            // Tray-local = the tray's cell (0,0) at the origin; the layout-dependent
-            // print pattern uses it so translated previews and re-based entities stay aligned.
-            "vLocalPos = transformed + uLocalOrigin;\n" +
-            "vWorldNormal = normalize(mat3(modelMatrix) * objectNormal);",
-        );
+        .replace("#include <common>", `#include <common>\n${VERTEX_DECLS}`)
+        .replace("#include <worldpos_vertex>", `#include <worldpos_vertex>\n${VERTEX_BODY}`);
       shader.fragmentShader = shader.fragmentShader
         .replace(
           "#include <common>",
           `#include <common>
-varying vec3 vWorldPos;
-varying vec3 vLocalPos;
-uniform float uGhostOn;
-uniform vec2 uGhostMin;
-uniform vec2 uGhostMax;
-uniform float uGhostAlpha;
-uniform float uReveal;
-uniform float uAnimTop;
-varying vec3 vWorldNormal;
+${FRAG_DECLS}
 uniform vec3 uSelMin;
 uniform vec3 uSelMax;
 uniform float uSelActive;
-uniform float uPrint;
-uniform float uLayerH;
-uniform float uLineW;
-uniform float uFillAngle;
-uniform float uRelief;
-uniform float uSeamShade;
 uniform sampler2D uRegions;
 uniform vec2 uGrid;
 uniform float uWall;
-uniform float uPerims;
 #define FDM_PITCH ${PITCH}.0
 #define FDM_CLEAR ${CLEAR}
 #define FDM_ROUT ${R_OUT}
-// Signed distance to the rounded rectangle [a,b] (corner radius r), and its gradient.
-float sdRoundRect(vec2 p, vec2 a, vec2 b, float r, out vec2 grad) {
-  vec2 d = p - 0.5 * (a + b);
-  vec2 q = abs(d) - (0.5 * (b - a) - vec2(r));
-  vec2 s = vec2(d.x < 0.0 ? -1.0 : 1.0, d.y < 0.0 ? -1.0 : 1.0);
-  if (q.x > 0.0 && q.y > 0.0) {
-    float l = length(q);
-    grad = s * q / max(l, 1e-6);
-    return l - r;
-  }
-  if (q.x > q.y) { grad = vec2(s.x, 0.0); return q.x - r; }
-  grad = vec2(0.0, s.y);
-  return q.y - r;
-}
 // Pocket outline of the compartment covering the given grid cell — mirrors the
 // pocket rect + corner radius in cad.worker.ts buildTray; keep them in sync.
 void pocketRect(ivec2 cell, out vec2 a, out vec2 b, out float r) {
@@ -1011,11 +456,9 @@ void pocketRect(ivec2 cell, out vec2 a, out vec2 b, out float r) {
   vec2 size = b - a;
   r = max(0.4, min(min(FDM_ROUT - uWall, 0.5 * size.x - 0.1), 0.5 * size.y - 0.1));
 }
-// Distance from an up-facing fragment (world xz) to the nearest edge of the flat
-// region it sits on — a pocket outline or the tray's outer outline — and the
-// in-plane direction pointing away from that edge. Checks the fragment's cell
-// and the three neighbours toward the nearest grid corner, which covers every
-// wall top and junction.
+// The tray's flat regions: a pocket outline, or the tray's outer outline.
+// Checks the fragment's cell and the three neighbours toward the nearest grid
+// corner, which covers every wall top and junction.
 float topEdgeDist(vec2 p, out vec2 away) {
   vec2 cellF = clamp(floor(p / FDM_PITCH), vec2(0.0), uGrid - 1.0);
   vec2 f = p / FDM_PITCH - cellF;
@@ -1035,41 +478,12 @@ float topEdgeDist(vec2 p, out vec2 away) {
   float dOut = -sdRoundRect(p, vec2(FDM_CLEAR), uGrid * FDM_PITCH - FDM_CLEAR, FDM_ROUT, g);
   if (dOut < best) { best = dOut; away = -g; }
   return best;
-}
-// Bead cross-section over one period, u in [-1,1] (crest at 0, seams at ±1):
-// a half-disc up close, morphing (s→1) into a pure cosine as the period
-// shrinks on screen — the disc's seam harmonics alias long before its period.
-float fdmProfile(float u, float s) {
-  float disc = sqrt(max(1.0 - u * u, 0.0));
-  float cosb = 0.5 + 0.5 * cos(PI * u);
-  return mix(disc, cosb, s);
-}
-// Slope per unit u; the disc's is clamped where it goes vertical at the seams.
-float fdmSlope(float u, float s) {
-  float disc = -u / max(sqrt(max(1.0 - u * u, 0.0)), 0.25);
-  float cosb = -0.5 * PI * sin(PI * u);
-  return mix(disc, cosb, s);
-}
-float fdmMean(float s) { return mix(0.785, 0.5, s); }
-float fdmHash(float x) { return fract(sin(x * 12.9898) * 43758.5453); }`,
+}`,
         )
         .replace(
           "vec4 diffuseColor = vec4( diffuse, opacity );",
           `vec4 diffuseColor = vec4( diffuse, opacity );
-#ifdef TRAY_REVEAL
-// Revealable variant (entities printing in): double-sided so the cut shows the
-// wall's inside, back faces dropped once whole, fragments above the progress
-// height dropped. The static tray compiles without this block — no discard at
-// all keeps early depth testing, which matters on a retina-sized canvas.
-if (!gl_FrontFacing && uReveal >= 1.0) discard;
-if (uReveal < 1.0 && vLocalPos.y >= uReveal * uAnimTop) discard;
-#endif
-if (uGhostOn > 0.5) {
-  bool outsideGhost = vWorldPos.x < uGhostMin.x || vWorldPos.x > uGhostMax.x ||
-    vWorldPos.z < uGhostMin.y || vWorldPos.z > uGhostMax.y;
-  // Partial alpha is partial MSAA coverage; no discard needed.
-  if (outsideGhost) diffuseColor.a *= uGhostAlpha;
-}
+${FRAG_GHOST}
 if (uSelActive > 0.5) {
   vec3 n = normalize(vWorldNormal);
   bool inBox = vWorldPos.x > uSelMin.x && vWorldPos.x < uSelMax.x &&
@@ -1087,96 +501,15 @@ if (uSelActive > 0.5) {
         .replace(
           "#include <normal_fragment_maps>",
           `#include <normal_fragment_maps>
-if (uPrint > 0.5) {
-  // Back faces show inside a cell that is still printing in; flip to shade them.
-  vec3 nw = normalize(vWorldNormal) * (gl_FrontFacing ? 1.0 : -1.0);
-  // Layers repeat along world y; top fill repeats along the fill direction in xz.
-  float ly = vWorldPos.y / uLayerH;
-  // Top pattern: uPerims loops hugging the region's edge, diagonal fill inside.
-  // Only up-facing fragments pay for the distance field (feet bottoms get fill).
-  vec2 dir = vec2(cos(uFillAngle), sin(uFillAngle));
-  vec2 away = dir;
-  float dEdge = 1e9;
-  if (nw.y > 0.5) dEdge = topEdgeDist(vLocalPos.xz, away);
-  bool perim = dEdge < uPerims * uLineW;
-  vec2 tdir = perim ? away : dir;
-  float ls = (perim ? dEdge : dot(vLocalPos.xz, dir)) / uLineW;
-  float uy = 2.0 * fract(ly) - 1.0;
-  float us = 2.0 * fract(ls) - 1.0;
-  // Screen footprint of each pattern in periods per pixel: soften the profile
-  // to a cosine from ~12px/period down, fade it out entirely by ~1.7px/period.
-  float fwY = fwidth(ly);
-  float fwS = fwidth(ls);
-  float sY = smoothstep(0.08, 0.3, fwY);
-  float sS = smoothstep(0.08, 0.3, fwS);
-  float aaY = 1.0 - smoothstep(0.35, 0.6, fwY);
-  float aaS = 1.0 - smoothstep(0.35, 0.6, fwS);
-  float wTop = smoothstep(0.7, 0.95, abs(nw.y));
-  // World-space gradient of the height field: relief = uRelief·period and
-  // d(bead)/d(world) = slope(u)·2/period, so the period cancels out.
-  float k = 2.0 * uRelief;
-  vec3 gY = vec3(0.0, fdmSlope(uy, sY) * k * aaY, 0.0);
-  vec3 gS = vec3(tdir.x, 0.0, tdir.y) * (fdmSlope(us, sS) * k * aaS);
-  vec3 g = mix(gY, gS, wTop);
-  vec3 np = normalize(nw - (g - nw * dot(nw, g)));
-  normal = normalize((viewMatrix * vec4(np, 0.0)).xyz);
-  // Seams sit in shadow; a touch of per-layer variation breaks the regularity.
-  float hY = mix(fdmMean(sY), fdmProfile(uy, sY), aaY);
-  float hS = mix(fdmMean(sS), fdmProfile(us, sS), aaS);
-  float h = mix(hY, hS, wTop);
-  float layerVar = (fdmHash(floor(ly)) - 0.5) * 0.08 * aaY * (1.0 - wTop);
-  diffuseColor.rgb *= (1.0 - uSeamShade * (1.0 - h)) * (1.0 + layerVar);
-}`,
+${FRAG_PRINT}`,
         );
     },
     [],
   );
 
   const onBeforeCompileEdges = useCallback(
-    (shader: Parameters<THREE.LineBasicMaterial["onBeforeCompile"]>[0]) => {
-      const u = uniforms.current;
-      Object.assign(shader.uniforms, {
-        uGhostOn: u.uGhostOn,
-        uGhostMin: u.uGhostMin,
-        uGhostMax: u.uGhostMax,
-        uGhostAlpha: u.uGhostAlpha,
-        uReveal: u.uReveal,
-        uAnimTop: u.uAnimTop,
-        uLocalOrigin: u.uLocalOrigin,
-      });
-      shader.vertexShader = shader.vertexShader
-        .replace(
-          "#include <common>",
-          "#include <common>\nvarying vec3 vWorldPos;\nvarying vec3 vLocalPos;\nuniform vec3 uLocalOrigin;",
-        )
-        .replace(
-          "#include <worldpos_vertex>",
-          "#include <worldpos_vertex>\nvWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;\nvLocalPos = transformed + uLocalOrigin;",
-        );
-      shader.fragmentShader = shader.fragmentShader
-        .replace(
-          "#include <common>",
-          `#include <common>
-varying vec3 vWorldPos;
-varying vec3 vLocalPos;
-uniform float uGhostOn;
-uniform vec2 uGhostMin;
-uniform vec2 uGhostMax;
-uniform float uGhostAlpha;
-uniform float uReveal;
-uniform float uAnimTop;`,
-        )
-        .replace(
-          "vec4 diffuseColor = vec4( diffuse, opacity );",
-          `vec4 diffuseColor = vec4( diffuse, opacity );
-if (uGhostOn > 0.5) {
-  bool outsideGhost = vWorldPos.x < uGhostMin.x || vWorldPos.x > uGhostMax.x ||
-    vWorldPos.z < uGhostMin.y || vWorldPos.z > uGhostMax.y;
-  if (outsideGhost) diffuseColor.a *= uGhostAlpha;
-}
-if (uReveal < 1.0 && vLocalPos.y >= uReveal * uAnimTop) discard;`,
-        );
-    },
+    (shader: Parameters<NonNullable<THREE.LineBasicMaterial["onBeforeCompile"]>>[0]) =>
+      patchEdgeMaterial(shader, uniforms.current),
     [],
   );
 
@@ -1360,7 +693,7 @@ function CadOverlay({ spec, geometry }: { spec: TraySpec; geometry: TrayGeometry
   useEffect(() => {
     const id = ++seq.current;
     const timer = setTimeout(() => {
-      requestMesh(spec)
+      requestMesh({ model: "tray", spec })
         .then((m) => {
           if (seq.current === id) setCad(m);
         })
@@ -1511,7 +844,7 @@ export default function Viewer({
   // the user's alone. Both objects must keep their identity: a fresh Canvas
   // `camera` config or controls target on re-render would teleport the view.
   const [initial] = useState(() => {
-    const pose = perspectivePose(cols, rows);
+    const pose = perspectivePose(cols * PITCH, rows * PITCH);
     return {
       pose,
       camera: {
@@ -1526,10 +859,7 @@ export default function Viewer({
     <div className="relative h-full w-full">
       <Canvas camera={initial.camera} dpr={[1, 2]}>
         <color attach="background" args={["#101012"]} />
-        <ambientLight intensity={0.55} />
-        <directionalLight position={[150, 300, 200]} intensity={1.4} />
-        <directionalLight position={[-200, 150, -100]} intensity={0.4} />
-        <directionalLight position={[50, -200, 80]} intensity={0.5} />
+        <SceneLights />
         <TrayMesh
           geometry={staticGeometry}
           sel={sel}
@@ -1560,8 +890,9 @@ export default function Viewer({
         <ResizeHandles3D
           cols={cols}
           rows={rows}
+          metrics={TRAY_METRICS}
           geometry={geometry}
-          trayRef={trayPickRef}
+          shapeRef={trayPickRef}
           shadow={shadow}
           setShadow={setShadow}
           onResize={handleResize}
@@ -1574,18 +905,7 @@ export default function Viewer({
           onSelect={handleSelect}
           onRelease={handleRelease}
         />
-        <Grid
-          position={[0, -0.05, 0]}
-          args={[10, 10]}
-          cellSize={PITCH / 2}
-          cellThickness={0.4}
-          cellColor="#2a2a2e"
-          sectionSize={PITCH}
-          sectionThickness={0.8}
-          sectionColor="#3d3d44"
-          fadeDistance={Math.max(extent * 6, 1200)}
-          infiniteGrid
-        />
+        <GroundGrid section={PITCH} extent={extent} />
         <MappedControls mappingId={viewMappingId} initialTarget={initial.pose.target} />
       </Canvas>
       {sel && popupPos && (canFuse || canSplit) && (
