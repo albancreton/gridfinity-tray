@@ -39,6 +39,9 @@ import {
   type SkadisSpec,
 } from "@/lib/skadis";
 import { buildBoardGeometry, type BoardGeometry } from "@/lib/boardMesher";
+import { meshBounds, meshVolume } from "@/lib/meshKit";
+import { requestMesh } from "@/lib/cadClient";
+import type { MeshData } from "@/lib/workerProtocol";
 import { DEFAULT_MAPPING_ID } from "@/lib/viewMapping";
 import { type ViewSettings } from "@/lib/viewSettings";
 import { GroundGrid, MappedControls, SceneLights, perspectivePose } from "./viewer/scene";
@@ -232,6 +235,77 @@ function BoardMesh({
   );
 }
 
+/**
+ * Dev builds: the CAD kernel's B-rep edges in red over the preview, plus
+ * `window.__compareBoard()` — the board's answer to the tray's `window.__compare()`.
+ * Mesher ↔ CAD agreement is the project's standing rule; this is how it gets
+ * checked without leaving the browser.
+ */
+function BoardCadOverlay({ spec, geometry }: { spec: SkadisSpec; geometry: BoardGeometry }) {
+  const [cad, setCad] = useState<MeshData | null>(null);
+  const seq = useRef(0);
+  useEffect(() => {
+    const id = ++seq.current;
+    // A big board takes seconds to build; don't chase every drag step.
+    const timer = setTimeout(() => {
+      requestMesh({ model: "skadis", spec })
+        .then((m) => {
+          if (seq.current === id) setCad(m);
+        })
+        .catch(() => {});
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [spec]);
+
+  const depth = boardSizeMm(spec).d;
+  // The worker's frame is OCC's (z up, plan z mapped to y = d − z), so the whole
+  // thing rotates −90° about x and then flips back along the rows axis.
+  const edges = useMemo(() => {
+    if (!cad) return null;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(cad.edges, 3));
+    return g;
+  }, [cad]);
+  useEffect(() => () => edges?.dispose(), [edges]);
+
+  useEffect(() => {
+    if (!cad) return;
+    const compare = () => {
+      // Expand the indexed CAD mesh into world-frame triangles.
+      const { vertices: v, triangles: t } = cad;
+      const soup = new Float32Array(t.length * 3);
+      for (let i = 0; i < t.length; i++) {
+        const k = t[i] * 3;
+        soup[i * 3] = v[k];
+        soup[i * 3 + 1] = v[k + 2];
+        soup[i * 3 + 2] = depth - v[k + 1];
+      }
+      const cadVol = meshVolume(soup);
+      const preVol = meshVolume(geometry.positions);
+      return {
+        cad: { bounds: meshBounds(soup), volume: cadVol },
+        preview: { bounds: meshBounds(geometry.positions), volume: preVol },
+        volumeDiffPct: ((preVol - cadVol) / cadVol) * 100,
+      };
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (window as any).__compareBoard = compare;
+  }, [cad, geometry, depth]);
+
+  if (!edges) return null;
+  // Shift along the worker's own y first, then rotate: (x, y, z)_occ becomes
+  // (x, z, d − y)_world, which is `plan z = d − occ y` (see buildBoard).
+  return (
+    <group rotation={[-Math.PI / 2, 0, 0]}>
+      <group position={[0, -depth, 0]}>
+        <lineSegments geometry={edges}>
+          <lineBasicMaterial color="#ff3b30" transparent opacity={0.9} depthTest={false} />
+        </lineSegments>
+      </group>
+    </group>
+  );
+}
+
 export default function BoardViewer({
   spec,
   onResize,
@@ -293,6 +367,9 @@ export default function BoardViewer({
           setShadow={setShadow}
           onResize={onResize}
         />
+        {process.env.NODE_ENV === "development" && view.cadOverlay && (
+          <BoardCadOverlay spec={spec} geometry={geometry} />
+        )}
         <GroundGrid section={SLOT_PITCH} extent={Math.max(size.w, size.d)} />
         <MappedControls mappingId={viewMappingId} initialTarget={initial.pose.target} />
       </Canvas>

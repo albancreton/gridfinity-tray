@@ -109,6 +109,12 @@ from the mesher (the per-cell layout makes it natural) instead of partitioning a
 The worker holds **no state** between requests; an export rebuilds the whole tray
 (~190ms at 1×1, ~570ms at 3×2 with magnets+lip; boolean ops dominate).
 
+**Board cost** is a different shape: the mesher is analytic and has no partition pass, so
+~4ms at 3×3 and ~15ms at 17×27 (the biggest real board, 229 slots, ~64k triangles) — it
+never needs debouncing. The *export* is the slow half, because OpenCASCADE does the work:
+~0.3s at 3×3, ~1.5s at 9×9, ~14s at 17×27 (5s building, 9s meshing the STL). Nothing is
+gated on size; see the chamfer note in "Gotchas" for why it isn't much worse.
+
 **Performance — judge it in a production build.** Measured Sept 2026 on a 7×2 → 9×2
 grow with drag steps, 1900² canvas: `next dev` shows main-thread stalls of ~150ms per
 drag snap, ~250ms at commit and ~130ms when the transition ends — all React 19
@@ -127,7 +133,7 @@ only a transition needs it, so the drag pays for the mesh alone and the idle tra
 the mesher's own, smaller soup); animations start on the second frame after the scene is
 up (see Transitions), so a stall delays them instead of eating them; and the static tray
 compiles a front-face-only shader variant with no `discard` (entities printing in use the
-double-sided `TRAY_REVEAL` variant) so early depth testing stays on at retina sizes.
+double-sided `MESH_REVEAL` variant) so early depth testing stays on at retina sizes.
 Note also that another tab hogging the CPU (a localhost:3001 video experience showed
 300ms tasks in the same trace) makes everything stutter.
 
@@ -137,6 +143,11 @@ Note also that another tab hogging the CPU (a localhost:3001 video experience sh
 the residue is arc sampling). The one deliberate deviation: when the floor is thicker than
 the height allows (pocket floor above the lip's socket floor), the CAD makes a stepped
 floor and the preview just lowers the floor.
+
+The board gets the same treatment: the CAD overlay toggle draws `buildBoard`'s edges over
+it too, and `window.__compareBoard()` returns bounds + volume of both. They agree to
+**<0.01%** — better than the tray, because a flat plate has fewer sampled arcs. The board
+has no deliberate deviation: preview and CAD are the same shape, chamfer included.
 
 ## Gridfinity numbers (mm) — in `protocol.ts` / `layout.ts`
 
@@ -299,7 +310,7 @@ the handles and the scene shell live in `components/viewer/` and read a `GridMet
   darken the diffuse (`uSeamShade`) and each layer gets a tiny hashed brightness
   offset. All knobs are uniforms in the same ref as the selection uniforms.
 
-## Parts (`lib/trayParts.ts`)
+## Parts (`lib/trayParts.ts`) — tray only
 
 - **Why:** animations need entities — "that wall", "that cell" — and the mesher emits one
   soup. `partitionTray(spec, geometry)` regroups it into `TrayPart`s that tile the tray
@@ -329,7 +340,12 @@ the handles and the scene shell live in `components/viewer/` and read a `GridMet
   into dozens of pieces here. Adding a new plan feature = a new key in `partAt` + its
   planes in `splitPlanes`.
 
-## Transitions (`lib/transitions.ts` + `lib/animPresets.ts` + Viewer.tsx)
+## Transitions (`lib/transitions.ts` + `lib/animPresets.ts` + Viewer.tsx) — tray only
+
+Boards have neither parts nor transitions: a resize swaps the mesh outright. Adding them
+would mean partitioning the board per lattice tile (natural — the mesher already builds it
+that way) and a `makeBoardTransition` keyed on `tile:c,r`; the presets in `animPresets.ts`
+are model-agnostic and would work unchanged.
 
 - **Model:** `makeTransition(prev, next, frame, at)` diffs two `Snapshot`s
   (`{grid, geometry: PartitionedTray, params}`) **by part key**: every old key is mapped
@@ -392,7 +408,7 @@ the handles and the scene shell live in `components/viewer/` and read a `GridMet
 - **Shader hooks the presets rely on:** `pose.opacity` reaches both materials through
   alpha-to-coverage, and `pose.reveal` feeds `uReveal`, which clips fragments above
   `reveal · uAnimTop`. That clip and the back-face discard live behind `#ifdef
-  TRAY_REVEAL`, a second program variant used only by entities whose preset needs it
+  MESH_REVEAL`, a second program variant used only by entities whose preset needs it
   (`revealable`, today just `printIn`) — the static tray and every other entity compile
   the front-face-only variant with no `discard`, which keeps early depth testing on. The
   ghost uniforms are untouched by entities (`ghost={null}`).
@@ -436,13 +452,15 @@ the handles and the scene shell live in `components/viewer/` and read a `GridMet
   checks will report collinear T-junctions (floor caps, underside seams, split top edges);
   those are geometrically watertight. Node repro: `npx tsx` a script importing the module.
 - **Dev hooks** (dev builds only): `window.__cad` (requestMesh/requestExport — parse the
-  STL blob to verify dimensions), `window.__buildTray` (the mesher; time it or diff it
-  against `__cad.requestMesh` for a spec), `window.__compare()` (bounds + volume of the
-  preview vs the CAD mesh; needs the CAD overlay toggle on), `window.__transition` and
+  STL blob to verify dimensions — it takes a `Job`, e.g. `{model: "skadis", spec}`),
+  `window.__buildTray` and `window.__buildBoard` (the two meshers; time one or diff it
+  against `__cad.requestMesh` for a spec), `window.__compare()` / `window.__compareBoard()`
+  (bounds + volume of the preview vs the CAD mesh; both need the CAD overlay toggle on),
+  `window.__transition` and
   `window.__animSlow` (see Transitions), `window.__controls` (OrbitControls instance) and
   `window.__scene` (THREE.Scene — the default camera is *not* parented to it, so
   traversing from `__controls.object` finds nothing) and `window.__printUniforms` (the
-  tray shader's uniform bag — tweak `uRelief`/`uSeamShade`/`uFillAngle` live).
+  *displayed* model's shader uniform bag — tweak `uRelief`/`uSeamShade`/`uFillAngle` live).
   Synthetic PointerEvents with fake pointerIds make OrbitControls' `releasePointerCapture`
   throw, leaving its internal drag state stuck (wheel stops working) — reload the page
   after event-driven tests; real mice are unaffected.
