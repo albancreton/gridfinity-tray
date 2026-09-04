@@ -21,7 +21,7 @@ import {
 } from "@/lib/protocol";
 import { meshBounds, meshVolume, type TrayGeometry } from "@/lib/trayMesher";
 import { mergeParts, type PartitionedTray, type TrayPart } from "@/lib/trayParts";
-import { presets, restPose, type Playback, type Pose } from "@/lib/animPresets";
+import { GHOST_ALPHA, presets, restPose, type Playback, type Pose } from "@/lib/animPresets";
 import { makeTransition, type EntityAnim, type Snapshot, type Transition } from "@/lib/transitions";
 import { requestMesh } from "@/lib/cadClient";
 import {
@@ -795,7 +795,6 @@ function TrayMesh({
   params,
   view,
   ghost,
-  ghostAlpha = 0.25,
   pose,
   origin,
   revealable = false,
@@ -814,9 +813,8 @@ function TrayMesh({
   grid: GridState;
   params: TrayParams;
   view: ViewSettings;
-  /** Resize footprint (displayed-world units): fragments outside it fade to `ghostAlpha` — the part a shrink removes. */
+  /** Resize footprint (displayed-world units): fragments outside it fade to `GHOST_ALPHA` — the part a shrink removes. */
   ghost: Frame | null;
-  ghostAlpha?: number;
   pickRef?: React.Ref<THREE.Mesh>;
 }) {
   const uniforms = useRef({
@@ -827,7 +825,7 @@ function TrayMesh({
     /** Ghost box in world xz; fragments outside it fade to `uGhostAlpha`. */
     uGhostMin: { value: new THREE.Vector2() },
     uGhostMax: { value: new THREE.Vector2() },
-    uGhostAlpha: { value: 0.25 },
+    uGhostAlpha: { value: GHOST_ALPHA },
     /** Fraction of the tray height that exists yet (the print-in reveal); 1 = whole. */
     uReveal: { value: 1 },
     /** Height a fully revealed tray reaches (a hair above the rim). */
@@ -857,14 +855,13 @@ function TrayMesh({
   useEffect(() => {
     const u = uniforms.current;
     u.uGhostOn.value = ghost ? 1 : 0;
-    u.uGhostAlpha.value = ghostAlpha;
     if (!ghost) return;
     // Interior walls straddle the grid line by wall/2: keep the one that
     // becomes the new outer wall solid, so the kept part reads as a whole tray.
     const m = params.wall / 2;
     u.uGhostMin.value.set(ghost.c0 * PITCH - m, ghost.r0 * PITCH - m);
     u.uGhostMax.value.set(ghost.c1 * PITCH + m, ghost.r1 * PITCH + m);
-  }, [ghost, ghostAlpha, params.wall]);
+  }, [ghost, params.wall]);
 
   useEffect(() => {
     uniforms.current.uAnimTop.value = trayTopY(params) + 0.5;

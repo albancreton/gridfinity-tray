@@ -159,7 +159,10 @@ floor and the preview just lowers the floor.
   a left/top resize is applied by a layout effect keyed on the geometry identity, i.e. in
   the commit that swaps the geometry. The state lives in `Viewer` because the tray renders
   from it too: `TrayMesh`'s `ghost` prop feeds `uGhost*` uniforms and fragments **outside**
-  the kept box (expanded by wall/2 so the future outer wall stays solid) get 25% alpha —
+  the kept box (expanded by wall/2 so the future outer wall stays solid) fade to
+  `GHOST_ALPHA` (0.5, exported from `animPresets.ts`; the `cellOut`/`fadeOut` presets
+  `prepare` to the same value so the commit continues the fade instead of flashing back
+  to solid — change one, change both) —
   via **alpha-to-coverage** on the still-opaque material, which the multisampled canvas
   resolves to a clean fade with no self-overlap sorting artifacts; the edge lines get the
   same factor through their own `onBeforeCompile` sharing the uniform objects. So a shrink

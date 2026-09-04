@@ -61,6 +61,13 @@ export const PRESET_MS = {
 } as const;
 export type PresetName = keyof typeof PRESET_MS;
 
+/**
+ * Coverage of the cells a shrink is about to remove, while the handle is still
+ * held (Viewer's `uGhostAlpha`). The `*Out` presets start from it, so the commit
+ * continues that fade instead of flashing back to solid — keep them in step.
+ */
+export const GHOST_ALPHA = 0.5;
+
 /** mm a cell travels along the up axis while it fades. */
 export const CELL_TRAVEL = 300;
 export const CELL_TRAVEL_OUT = -30;
@@ -97,6 +104,9 @@ export const presets: Record<PresetName, Preset> = {
   },
   /** The reverse: lifts off and fades. */
   cellOut: {
+    prepare(pose) {
+      pose.opacity = GHOST_ALPHA;
+    },
     play(pose, ctx) {
       return animate(pose, { y: CELL_TRAVEL_OUT, opacity: 0 }, { duration: secs("cellOut"), delay: ctx.delay, ease: "easeIn" });
     },
@@ -110,6 +120,9 @@ export const presets: Record<PresetName, Preset> = {
     },
   },
   fadeOut: {
+    prepare(pose) {
+      pose.opacity = GHOST_ALPHA;
+    },
     play(pose, ctx) {
       return animate(pose, { opacity: 0 }, { duration: secs("fadeOut"), delay: ctx.delay });
     },
