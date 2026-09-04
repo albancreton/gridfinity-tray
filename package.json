@@ -5,10 +5,12 @@
   "scripts": {
     "dev": "next dev -p 3100",
     "build": "next build",
+    "build:pages": "NEXT_OUTPUT=export NEXT_PUBLIC_BASE_PATH=/gridfinity-tray next build",
     "start": "next start -p 3100",
     "lint": "eslint",
     "predev": "node scripts/copy-wasm.mjs",
-    "prebuild": "node scripts/copy-wasm.mjs"
+    "prebuild": "node scripts/copy-wasm.mjs",
+    "prebuild:pages": "node scripts/copy-wasm.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

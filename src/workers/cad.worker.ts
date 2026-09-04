@@ -30,7 +30,9 @@ let ocReady: Promise<void> | null = null;
 function init(): Promise<void> {
   if (!ocReady) {
     ocReady = initOpenCascade({
-      locateFile: () => "/replicad_single.wasm",
+      // public/ is served from the base path, which is "" everywhere except on
+      // GitHub Pages; NEXT_PUBLIC_* is inlined into this worker bundle at build time.
+      locateFile: () => `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/replicad_single.wasm`,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any).then((oc: unknown) => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

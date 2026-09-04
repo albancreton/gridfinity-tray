@@ -33,6 +33,27 @@ react-three-fiber 9 + drei 10 · replicad 1.0 over OpenCASCADE WASM, in a web wo
   a second one; `next dev` refuses duplicates for this dir anyway). Hot reload works.
 - `npx tsc --noEmit && npx eslint src --max-warnings 0` — the check to run after changes.
 - `npm run build` — production build (prebuild copies the WASM, see below).
+- `npm run build:pages` — the same build as a static export into `out/`, base-pathed
+  for GitHub Pages. See "Deployment".
+
+## Deployment (GitHub Pages)
+
+`.github/workflows/deploy-pages.yml` builds on every push to `main` and publishes
+`out/` to <https://albancreton.github.io/gridfinity-tray/>. Nothing here needs a server,
+so `output: "export"` covers it — but two knobs in `next.config.ts` stay **off** by
+default (`NEXT_OUTPUT`, `NEXT_PUBLIC_BASE_PATH`) so `next dev` and `next build && next
+start` behave exactly as before; only `build:pages` sets them. What the base path
+touches:
+
+- Next rewrites its own asset URLs, including the static `resize.svg` import.
+- The worker's WASM is fetched **by hand** (`locateFile` in `cad.worker.ts`), so it
+  reads `process.env.NEXT_PUBLIC_BASE_PATH` — inlined into the worker bundle at build
+  time. An absolute `/replicad_single.wasm` 404s under a project page.
+- `out/.nojekyll` (added in CI) keeps Pages from skipping `_next/`.
+
+Verified against the real artifact served under `/gridfinity-tray/`: the page renders,
+Turbopack's worker chunks load, the WASM fetch is prefixed, and an STL export comes back.
+A custom domain would just want an empty base path.
 
 ## Architecture (data flows top to bottom)
 
