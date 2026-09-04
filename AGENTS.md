@@ -51,9 +51,11 @@ touches:
   time. An absolute `/replicad_single.wasm` 404s under a project page.
 - `out/.nojekyll` (added in CI) keeps Pages from skipping `_next/`.
 
-Verified against the real artifact served under `/gridfinity-tray/`: the page renders,
-Turbopack's worker chunks load, the WASM fetch is prefixed, and an STL export comes back.
-A custom domain would just want an empty base path.
+Verified on the deployed site, not just on the build: the canvas renders, Turbopack's
+worker chunks load, the WASM fetch is prefixed, and an STL export comes back at spec
+dimensions (see "Gridfinity numbers"). A custom domain would just want an empty base
+path. CI warns that the `@v4` actions target the deprecated Node 20 and get forced onto
+Node 24 — a warning, not a failure.
 
 ## Architecture (data flows top to bottom)
 
@@ -122,7 +124,9 @@ floor and the preview just lowers the floor.
   if it matters.
 - Magnets: Ø6.5 × 2.4 pockets at ±13 from each foot center (4 per foot), default off.
 - Height param = bottom of feet → top of wall, lip excluded. `topZ = max(heightMm, 5.75) + lip·4.4`.
-- Verified: 2×1 @ h21+lip exports exactly 83.5 × 41.5 × 25.4.
+- Verified: 2×1 @ h21+lip exports exactly 83.5 × 41.5 × 25.4; and 1×1 @ h21+lip
+  exported *from the live Pages site* is a 3188-triangle binary STL measuring
+  41.5 × 41.5 × 25.4, so the deployed WASM kernel is the same one.
 
 ## 3D view conventions (Viewer.tsx)
 
@@ -348,9 +352,9 @@ floor and the preview just lowers the floor.
 
 ## Gotchas learned the hard way
 
-- **WASM plumbing:** `scripts/copy-wasm.mjs` (predev/prebuild) copies
+- **WASM plumbing:** `scripts/copy-wasm.mjs` (predev / prebuild / prebuild:pages) copies
   `replicad-opencascadejs/dist/replicad_single.wasm` → `public/` (gitignored); the worker
-  loads it via `locateFile: () => "/replicad_single.wasm"`. Fresh clone = `npm install`
+  loads it via `locateFile`, base-pathed (see "Deployment"). Fresh clone = `npm install`
   then dev/build; nothing else.
 - **OrbitControls modifier swap:** three's OrbitControls silently swaps orbit↔pan when
   ctrl/meta/shift is held on the pointer event. `MappedControls` (Viewer.tsx) pre-inverts
@@ -391,6 +395,10 @@ floor and the preview just lowers the floor.
   Synthetic PointerEvents with fake pointerIds make OrbitControls' `releasePointerCapture`
   throw, leaving its internal drag state stuck (wheel stops working) — reload the page
   after event-driven tests; real mice are unaffected.
+- **`out/` must stay excluded from `tsconfig.json`.** A `build:pages` run emits the raw
+  worker source as a static asset (`out/_next/static/media/cad.worker.*.ts`), which the
+  `**/*.ts` include would then typecheck out of context — `npx tsc --noEmit` fails on
+  unresolvable `../lib/*` imports until you delete `out/`. eslint already ignores it.
 - Removing a drei OrbitControls prop doesn't reset it on HMR — full-reload the page.
   Same for GLSL edits inside `onBeforeCompile`: three keeps the program compiled from
   the first callback, so the material never picks up the new source without a reload.
