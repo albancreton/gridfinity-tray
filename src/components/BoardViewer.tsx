@@ -5,6 +5,11 @@
 // per-entity transitions — the only edit is dragging an edge to add or remove
 // lattice columns and rows, which the shared handles already do.
 //
+// A split board draws one `BoardMesh` per printable piece. Every piece is meshed
+// in board coordinates and the print pattern reads object space, so the printed
+// look stays continuous across a seam — and an exploded view is then just a
+// translation of the group, with nothing to recompute.
+//
 // What it does share with the tray: the scene shell (controls, lights, ground),
 // the resize handles and their ghost preview, and the printed-look shader —
 // only the `topEdgeDist` below is the board's own.
@@ -36,9 +41,12 @@ import {
   SLOT_W,
   UNIT_STEP,
   boardSizeMm,
+  boardSplit,
+  pieceBounds,
+  type BoardPiece,
   type SkadisSpec,
 } from "@/lib/skadis";
-import { buildBoardGeometry, type BoardGeometry } from "@/lib/boardMesher";
+import { buildBoardGeometry, type BoardGeometry, type PieceGeometry } from "@/lib/boardMesher";
 import { meshBounds, meshVolume } from "@/lib/meshKit";
 import { requestMesh } from "@/lib/cadClient";
 import type { MeshData } from "@/lib/workerProtocol";
@@ -51,6 +59,7 @@ import { ResizeHandles3D, type ShadowState } from "./viewer/handles";
  * The board's unit grid: 20mm lattice positions, the first one `MARGIN` in from
  * the edge, so a unit boundary sits at `MARGIN − LATTICE/2 + LATTICE·u` and the
  * board overhangs the outermost boundary by half a step. Counts are odd only.
+ * A cut lands on one of these boundaries, which is why a split rejoins exactly.
  */
 export const BOARD_METRICS: GridMetrics = {
   pitch: LATTICE,
@@ -61,17 +70,22 @@ export const BOARD_METRICS: GridMetrics = {
   step: UNIT_STEP,
 };
 
+/** How far apart the exploded view pulls neighbouring pieces. */
+const EXPLODE_GAP = 8;
+
 /**
  * The board's flat regions for the printed look. Both faces are one plane
  * pierced by slots, and the slots are a checkerboard — which is two interleaved
  * 40mm lattices, one per parity. So the nearest slot is a round-to-lattice on
  * each, clamped to the range that actually carries slots, and the perimeter
- * loops fall out of the obround's own signed distance. The board outline is the
- * other edge a loop can hug.
+ * loops fall out of the obround's own signed distance. The piece's own outline
+ * is the other edge a loop can hug — a seam included, taken as the straight line
+ * it very nearly is (the teeth are far too small to read at this scale).
  */
 const BOARD_TOP_EDGE_DIST = `uniform vec4 uSlotA;
 uniform vec4 uSlotB;
-uniform vec2 uBoardSize;
+uniform vec2 uPieceMin;
+uniform vec2 uPieceMax;
 #define SLOT_PITCH ${SLOT_PITCH}.0
 #define SLOT_HX ${SLOT_W / 2}
 #define SLOT_HZ ${SLOT_H / 2}
@@ -82,6 +96,7 @@ float topEdgeDist(vec2 p, out vec2 away) {
   away = vec2(1.0, 0.0);
   for (int i = 0; i < 2; i++) {
     vec4 rng = i == 0 ? uSlotA : uSlotB;
+    if (rng.z < rng.x) continue;               // this parity has no slot in this piece
     // Nearest centre on this parity's lattice, kept inside the slotted range.
     vec2 c = clamp(rng.xy + SLOT_PITCH * floor((p - rng.xy) / SLOT_PITCH + 0.5), rng.xy, rng.zw);
     vec2 g;
@@ -90,53 +105,65 @@ float topEdgeDist(vec2 p, out vec2 away) {
     if (d < best) { best = d; away = sd < 0.0 ? -g : g; }
   }
   vec2 g;
-  float dOut = -sdRoundRect(p, vec2(0.0), uBoardSize, BOARD_RAD, g);
+  float dOut = -sdRoundRect(p, uPieceMin, uPieceMax, BOARD_RAD, g);
   if (dOut < best) { best = dOut; away = -g; }
   return best;
 }`;
 
 /**
- * The two parities' slot lattices as (xMin, zMin, xMax, zMax). Set A is the odd
- * columns / even rows, set B the other — see `hasSlot` in lib/skadis.
+ * The two parities' slot lattices inside one piece, as (xMin, zMin, xMax, zMax).
+ * Set A is the odd columns / even rows, set B the other — see `hasSlot` in
+ * lib/skadis. A narrow piece can hold none of one parity; that range comes back
+ * inverted and the shader skips it.
  */
-function slotRanges(cols: number, rows: number) {
+function slotRanges(p: BoardPiece) {
   const u = (n: number) => MARGIN + LATTICE * n;
-  return {
-    a: new THREE.Vector4(u(1), u(0), u(cols - 2), u(rows - 1)),
-    b: new THREE.Vector4(u(0), u(1), u(cols - 1), u(rows - 2)),
-  };
+  // First/last index in [a, b] with the given parity.
+  const first = (a: number, b: number, odd: number) => (a % 2 === odd ? a : a + 1 > b ? a + 2 : a + 1);
+  const last = (a: number, b: number, odd: number) => (b % 2 === odd ? b : b - 1);
+  const rng = (odd: number) =>
+    new THREE.Vector4(
+      u(first(p.c0, p.c1, odd)),
+      u(first(p.r0, p.r1, 1 - odd)),
+      u(last(p.c0, p.c1, odd)),
+      u(last(p.r0, p.r1, 1 - odd)),
+    );
+  return { a: rng(1), b: rng(0) };
 }
 
 function BoardMesh({
-  geometry: board,
+  geometry: piece,
   spec,
   view,
   ghost,
-  pickRef,
+  offset,
 }: {
-  geometry: BoardGeometry;
+  geometry: PieceGeometry;
   spec: SkadisSpec;
   view: ViewSettings;
   /** Resize footprint (lattice units): fragments outside it fade to `GHOST_ALPHA`. */
   ghost: Frame | null;
-  pickRef?: React.Ref<THREE.Mesh>;
+  /** Exploded-view translation, in mm. */
+  offset: [number, number, number];
 }) {
   const uniforms = useRef({
     ...printUniforms(GHOST_ALPHA),
     uSlotA: { value: new THREE.Vector4() },
     uSlotB: { value: new THREE.Vector4() },
-    uBoardSize: { value: new THREE.Vector2() },
+    uPieceMin: { value: new THREE.Vector2() },
+    uPieceMax: { value: new THREE.Vector2() },
   });
 
   useEffect(() => {
     const u = uniforms.current;
-    const { a, b } = slotRanges(spec.cols, spec.rows);
+    const { a, b } = slotRanges(piece.piece);
     u.uSlotA.value.copy(a);
     u.uSlotB.value.copy(b);
-    const size = boardSizeMm(spec);
-    u.uBoardSize.value.set(size.w, size.d);
-    u.uAnimTop.value = size.h + 0.5;
-  }, [spec]);
+    const bounds = pieceBounds(piece.piece);
+    u.uPieceMin.value.set(bounds.x0, bounds.z0);
+    u.uPieceMax.value.set(bounds.x1, bounds.z1);
+    u.uAnimTop.value = spec.thickness + 0.5;
+  }, [piece, spec]);
 
   useEffect(() => {
     const u = uniforms.current;
@@ -192,12 +219,12 @@ function BoardMesh({
   // frame (x cols, y up, z rows), so the geometry is uploaded as is.
   const { geometry, edgeGeometry } = useMemo(() => {
     const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(board.positions, 3));
-    g.setAttribute("normal", new THREE.BufferAttribute(board.normals, 3));
+    g.setAttribute("position", new THREE.BufferAttribute(piece.positions, 3));
+    g.setAttribute("normal", new THREE.BufferAttribute(piece.normals, 3));
     const e = new THREE.BufferGeometry();
-    e.setAttribute("position", new THREE.BufferAttribute(board.edges, 3));
+    e.setAttribute("position", new THREE.BufferAttribute(piece.edges, 3));
     return { geometry: g, edgeGeometry: e };
-  }, [board]);
+  }, [piece]);
   useEffect(
     () => () => {
       geometry.dispose();
@@ -207,8 +234,8 @@ function BoardMesh({
   );
 
   return (
-    <group>
-      <mesh ref={pickRef} geometry={geometry} castShadow receiveShadow>
+    <group position={offset}>
+      <mesh geometry={geometry} castShadow receiveShadow>
         <meshStandardMaterial
           ref={materialRef}
           color="#C6CBD2"
@@ -239,7 +266,8 @@ function BoardMesh({
  * Dev builds: the CAD kernel's B-rep edges in red over the preview, plus
  * `window.__compareBoard()` — the board's answer to the tray's `window.__compare()`.
  * Mesher ↔ CAD agreement is the project's standing rule; this is how it gets
- * checked without leaving the browser.
+ * checked without leaving the browser. With no `piece` the worker returns every
+ * piece as one compound, so a split board is checked whole.
  */
 function BoardCadOverlay({ spec, geometry }: { spec: SkadisSpec; geometry: BoardGeometry }) {
   const [cad, setCad] = useState<MeshData | null>(null);
@@ -281,10 +309,18 @@ function BoardCadOverlay({ spec, geometry }: { spec: SkadisSpec; geometry: Board
         soup[i * 3 + 2] = depth - v[k + 1];
       }
       const cadVol = meshVolume(soup);
-      const preVol = meshVolume(geometry.positions);
+      const preVol = geometry.pieces.reduce((a, p) => a + meshVolume(p.positions), 0);
+      const preBounds = geometry.pieces.map((p) => meshBounds(p.positions));
       return {
         cad: { bounds: meshBounds(soup), volume: cadVol },
-        preview: { bounds: meshBounds(geometry.positions), volume: preVol },
+        preview: {
+          bounds: {
+            min: preBounds.reduce((a, b) => a.map((v2, i) => Math.min(v2, b.min[i])) as typeof a, preBounds[0].min),
+            max: preBounds.reduce((a, b) => a.map((v2, i) => Math.max(v2, b.max[i])) as typeof a, preBounds[0].max),
+          },
+          volume: preVol,
+        },
+        pieces: geometry.pieces.length,
         volumeDiffPct: ((preVol - cadVol) / cadVol) * 100,
       };
     };
@@ -320,14 +356,21 @@ export default function BoardViewer({
 }) {
   const { cols, rows } = spec;
   const size = boardSizeMm(spec);
-  const pickRef = useRef<THREE.Mesh | null>(null);
+  // The handles raycast against this to ignore hits the board covers; with a
+  // split it holds one mesh per piece, which is why that test is recursive.
+  const pickRef = useRef<THREE.Group | null>(null);
   // Pending resize footprint. Lives here because both the handles (badge,
   // handle placement) and the board (ghosting what a shrink removes) render from it.
   const [shadow, setShadow] = useState<ShadowState | null>(null);
 
-  // A flat plate is cheap to mesh (~15ms for the largest real board), so this
-  // stays synchronous like the tray's — every change shows on the next frame.
+  // A flat plate is cheap to mesh (~30ms for the largest real board, split into
+  // twelve), so this stays synchronous like the tray's — every change shows on
+  // the next frame.
   const geometry = useMemo(() => buildBoardGeometry(spec), [spec]);
+  const grid = useMemo(() => {
+    const split = boardSplit(spec);
+    return { nx: split.cutsC.length + 1, nz: split.cutsR.length + 1 };
+  }, [spec]);
 
   // The camera frames the board as mounted and is then the user's alone. Both
   // objects must keep their identity: a fresh Canvas `camera` config or controls
@@ -350,13 +393,26 @@ export default function BoardViewer({
       <Canvas camera={initial.camera} dpr={[1, 2]}>
         <color attach="background" args={["#101012"]} />
         <SceneLights />
-        <BoardMesh
-          geometry={geometry}
-          spec={spec}
-          view={view}
-          ghost={shadow}
-          pickRef={pickRef}
-        />
+        <group ref={pickRef}>
+          {geometry.pieces.map((p) => (
+            <BoardMesh
+              key={`${p.piece.ci}:${p.piece.ri}`}
+              geometry={p}
+              spec={spec}
+              view={view}
+              ghost={shadow}
+              offset={
+                view.explode
+                  ? [
+                      (p.piece.ci - (grid.nx - 1) / 2) * EXPLODE_GAP,
+                      0,
+                      (p.piece.ri - (grid.nz - 1) / 2) * EXPLODE_GAP,
+                    ]
+                  : [0, 0, 0]
+              }
+            />
+          ))}
+        </group>
         <ResizeHandles3D
           cols={cols}
           rows={rows}

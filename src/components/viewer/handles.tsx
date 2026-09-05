@@ -139,7 +139,7 @@ function Handle({
   active: boolean;
   /** Another handle is in use: fade out and stop taking the pointer. */
   dimmed: boolean;
-  shapeRef: React.RefObject<THREE.Mesh | null>;
+  shapeRef: React.RefObject<THREE.Object3D | null>;
   onDown: (side: Side, e: ThreeEvent<PointerEvent>) => void;
 }) {
   const [hover, setHover] = useState(false);
@@ -147,12 +147,13 @@ function Handle({
   const hz = alongX(side) ? HANDLE_HIT_LONG : HANDLE_HIT_SHORT;
   // The model's mesh has no pointer handlers, so R3F raycasts straight through
   // it to the hit box: a handle hidden behind the shape would still hover and
-  // grab clicks. Check the event's own ray against the mesh and ignore covered
-  // hits (the click then falls through, as the user sees it).
+  // grab clicks. Check the event's own ray against the shape and ignore covered
+  // hits (the click then falls through, as the user sees it). Recursive, because
+  // a split board hands us the group holding one mesh per piece.
   const covered = (e: ThreeEvent<PointerEvent>) => {
     const shape = shapeRef.current;
     if (!shape) return false;
-    const first = new THREE.Raycaster(e.ray.origin, e.ray.direction).intersectObject(shape, false)[0];
+    const first = new THREE.Raycaster(e.ray.origin, e.ray.direction).intersectObject(shape, true)[0];
     return first !== undefined && first.distance < e.distance;
   };
   return (
@@ -304,7 +305,7 @@ export function ResizeHandles3D({
   /** The displayed model; its identity marks when a resize's geometry has landed. */
   geometry: object;
   /** The visible mesh, so handles it covers ignore the pointer. */
-  shapeRef: React.RefObject<THREE.Mesh | null>;
+  shapeRef: React.RefObject<THREE.Object3D | null>;
   /** The shadow currently shown (live, or committed and waiting); the viewer owns it. */
   shadow: ShadowState | null;
   setShadow: (s: ShadowState | null) => void;

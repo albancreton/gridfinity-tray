@@ -9,7 +9,10 @@ import type { SkadisSpec } from "./skadis";
 export type ModelKind = "tray" | "skadis";
 
 /** What to build. The `model` tag picks the builder in the worker. */
-export type Job = { model: "tray"; spec: TraySpec } | { model: "skadis"; spec: SkadisSpec };
+export type Job =
+  | { model: "tray"; spec: TraySpec }
+  /** `piece` selects one printable piece; without it every piece comes back as one compound. */
+  | { model: "skadis"; spec: SkadisSpec; piece?: number };
 
 export interface MeshData {
   vertices: Float32Array;

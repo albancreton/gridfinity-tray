@@ -300,6 +300,20 @@ function rayHit(origin: Pair, a: number, poly: Pair[]): Pair {
  * points sit on the hole's own chords so they match the wall built from the
  * same samples. Both rings must be star-shaped from the hole's bbox center.
  */
+/**
+ * A vertical wall along a closed outline, one quad per segment carrying the true
+ * outward normal of that edge. `loft` takes its normals from a centre point,
+ * which is only right for a convex ring — this is what a non-convex outline
+ * (a seam with teeth and sockets) needs.
+ */
+export function wallLoft(o: Outline, y0: number, y1: number, out: Sink) {
+  const n = o.pts.length;
+  for (let i = 0; i < n; i++) {
+    const a = o.pts[i];
+    const b = o.pts[(i + 1) % n];
+    out.quad(lift(a, y1), lift(b, y1), lift(b, y0), lift(a, y0), outward(a, b));
+  }
+}
 export function ringStrip(hole: Outline, boundary: Pair[], y: number, want: V3, out: Sink) {
   const center: Pair = [(hole.bbox[0] + hole.bbox[2]) / 2, (hole.bbox[1] + hole.bbox[3]) / 2];
   const angles: number[] = [];

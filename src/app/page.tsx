@@ -9,21 +9,28 @@ import { requestExport, downloadBlob } from "@/lib/cadClient";
 import { traySizeMm, type TrayParams, type TraySpec } from "@/lib/protocol";
 import {
   DEFAULT_SKADIS_PARAMS,
+  boardPieces,
   boardSizeMm,
+  boardSplit,
   initialBoard,
+  pieceFootprintMm,
   reframeBoard,
   type SkadisParams,
   type SkadisSpec,
   type SkadisState,
 } from "@/lib/skadis";
+import { makeZip } from "@/lib/zip";
 import { buildTrayParts } from "@/lib/trayParts";
 import { DEFAULT_VIEW, type ViewSettings } from "@/lib/viewSettings";
-import type { Job, ModelKind } from "@/lib/workerProtocol";
+import type { ModelKind } from "@/lib/workerProtocol";
 
 const Viewer = dynamic(() => import("@/components/Viewer"), { ssr: false });
 const BoardViewer = dynamic(() => import("@/components/BoardViewer"), { ssr: false });
 
 const STORAGE_KEY = "gridfinity-tray-v1";
+
+/** Which export is running, and how far through a split board's pieces it is. */
+export type ExportState = { kind: "stl" | "step"; done: number; total: number } | null;
 
 const DEFAULT_PARAMS: TrayParams = {
   heightMm: 21,
@@ -99,7 +106,8 @@ export default function Home() {
       );
     } catch {}
   }, [hydrated, model, grid, params, board, boardParams, view]);
-  const [exporting, setExporting] = useState<"stl" | "step" | null>(null);
+  /** Also the progress readout: a split board exports one file per piece. */
+  const [exporting, setExporting] = useState<ExportState>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
   const spec = useMemo<TraySpec>(
@@ -110,6 +118,13 @@ export default function Home() {
     () => ({ ...board, ...boardParams }),
     [board, boardParams],
   );
+  // The split the bed implies, as bed footprints (teeth included) — one entry
+  // when the board prints whole. Both the Settings readout and the export loop
+  // run off it.
+  const boardPlan = useMemo(
+    () => boardPieces(boardSpec.cols, boardSpec.rows, boardSplit(boardSpec)).map(pieceFootprintMm),
+    [boardSpec],
+  );
   // The preview is meshed synchronously from the layout and partitioned into
   // animatable parts — every change shows on the next frame. The CAD kernel (a
   // worker, loaded on first use) only builds exports.
@@ -118,18 +133,36 @@ export default function Home() {
   const fmt = (v: number) => String(Number(v.toFixed(2)));
 
   const handleExport = async (kind: "stl" | "step") => {
-    setExporting(kind);
+    setExporting({ kind, done: 0, total: 1 });
     setExportError(null);
+    const ext = kind === "stl" ? "stl" : "step";
     try {
-      const job: Job =
-        model === "skadis" ? { model: "skadis", spec: boardSpec } : { model: "tray", spec };
-      const blob = await requestExport(kind, job);
-      const ext = kind === "stl" ? "stl" : "step";
-      const name =
-        model === "skadis"
-          ? `skadis-board-${board.cols}x${board.rows}`
-          : `gridfinity-tray-${grid.cols}x${grid.rows}-h${params.heightMm}`;
-      downloadBlob(blob, `${name}.${ext}`);
+      if (model !== "skadis") {
+        const blob = await requestExport(kind, { model: "tray", spec });
+        downloadBlob(blob, `gridfinity-tray-${grid.cols}x${grid.rows}-h${params.heightMm}.${ext}`);
+        return;
+      }
+      const stem = `skadis-board-${board.cols}x${board.rows}`;
+      // STEP holds several solids happily, so a split board is one file with the
+      // pieces still in the assembled frame. STL is one solid per file, so the
+      // pieces are zipped rather than fired at the browser as N downloads.
+      if (boardPlan.length < 2 || kind === "step") {
+        setExporting({ kind, done: 0, total: 1 });
+        const blob = await requestExport(kind, { model: "skadis", spec: boardSpec });
+        downloadBlob(blob, `${stem}.${ext}`);
+        return;
+      }
+      const files: { name: string; data: Uint8Array }[] = [];
+      for (let i = 0; i < boardPlan.length; i++) {
+        setExporting({ kind, done: i, total: boardPlan.length });
+        const blob = await requestExport(kind, { model: "skadis", spec: boardSpec, piece: i });
+        const p = boardPlan[i];
+        files.push({
+          name: `${stem}-piece-${i + 1}of${boardPlan.length}-${fmt(p.w)}x${fmt(p.d)}.${ext}`,
+          data: new Uint8Array(await blob.arrayBuffer()),
+        });
+      }
+      downloadBlob(makeZip(files), `${stem}-${boardPlan.length}-pieces.zip`);
     } catch (err) {
       setExportError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -167,6 +200,7 @@ export default function Home() {
         onBoardChange={setBoardParams}
         view={view}
         onViewChange={setView}
+        boardPlan={boardPlan}
         onExport={handleExport}
         exporting={exporting}
       />
@@ -178,6 +212,7 @@ export default function Home() {
       )}
       <p className="absolute right-3 bottom-3 text-xs tabular-nums text-neutral-500">
         {fmt(size.w)} × {fmt(size.d)} × {fmt(size.h)} mm
+        {model === "skadis" && boardPlan.length > 1 && ` · ${boardPlan.length} pieces`}
       </p>
     </main>
   );

@@ -8,9 +8,16 @@ export interface ViewSettings {
   layerHeight: number;
   /** Dev builds only: draw the CAD kernel's edges in red over the procedural preview. */
   cadOverlay: boolean;
+  /** Pull a split board's pieces apart so the seams read. Board only; render-only. */
+  explode: boolean;
 }
 
-export const DEFAULT_VIEW: ViewSettings = { printLook: true, layerHeight: 0.2, cadOverlay: false };
+export const DEFAULT_VIEW: ViewSettings = {
+  printLook: true,
+  layerHeight: 0.2,
+  cadOverlay: false,
+  explode: false,
+};
 
 /** Nozzle-line width used for the top-fill beads (0.4mm nozzle, slightly squished). */
 export const NOZZLE_LINE_W = 0.42;

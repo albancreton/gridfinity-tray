@@ -4,9 +4,10 @@ import { NumberField } from "@base-ui/react/number-field";
 import { Popover } from "@base-ui/react/popover";
 import { Switch } from "@base-ui/react/switch";
 import type { TrayParams } from "@/lib/protocol";
-import type { SkadisParams } from "@/lib/skadis";
+import { DEFAULT_BED, type JointKind, type SkadisParams } from "@/lib/skadis";
 import type { ModelKind } from "@/lib/workerProtocol";
 import type { ViewSettings } from "@/lib/viewSettings";
+import type { ExportState } from "@/app/page";
 import { POPUP, TRIGGER } from "./popoverStyles";
 
 interface Props {
@@ -18,8 +19,10 @@ interface Props {
   onBoardChange: (next: SkadisParams) => void;
   view: ViewSettings;
   onViewChange: (next: ViewSettings) => void;
+  /** The split the board's print bed implies; one entry when it prints whole. */
+  boardPlan: { w: number; d: number }[];
   onExport: (kind: "stl" | "step") => void;
-  exporting: "stl" | "step" | null;
+  exporting: ExportState;
 }
 
 function Field({
@@ -90,6 +93,74 @@ function Toggle({
   );
 }
 
+const JOINTS: { value: JointKind; label: string }[] = [
+  { value: "jigsaw", label: "Jigsaw" },
+  { value: "dovetail", label: "Dovetail" },
+];
+
+function Choice<T extends string>({
+  label,
+  value,
+  options,
+  onValue,
+}: {
+  label: string;
+  value: T;
+  options: { value: T; label: string }[];
+  onValue: (v: T) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-sm text-neutral-300">{label}</span>
+      <div className="flex gap-1.5">
+        {options.map((o) => (
+          <button
+            key={o.value}
+            className={`rounded px-2 py-0.5 text-xs ${
+              value === o.value
+                ? "bg-sky-600 text-white"
+                : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700"
+            }`}
+            onClick={() => onValue(o.value)}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * What the bed bought you. A piece may be rotated onto the plate, so the fit
+ * test is either way round — and if even one lattice tile is bigger than the
+ * bed there is no plan to make, which is worth saying out loud.
+ */
+function SplitReadout({
+  plan,
+  bed,
+}: {
+  plan: { w: number; d: number }[];
+  bed: { w: number; d: number };
+}) {
+  const n = (v: number) => String(Number(v.toFixed(1)));
+  const fits = (p: { w: number; d: number }) =>
+    (p.w <= bed.w && p.d <= bed.d) || (p.w <= bed.d && p.d <= bed.w);
+  if (!plan.every(fits)) {
+    return (
+      <p className="text-xs text-amber-400">
+        Too small to split onto — one lattice tile already exceeds the bed.
+      </p>
+    );
+  }
+  return (
+    <p className="text-xs tabular-nums text-neutral-400">
+      {plan.length === 1 ? "Prints whole · " : `${plan.length} pieces · `}
+      {plan.map((p) => `${n(p.w)}×${n(p.d)}`).join(", ")}
+    </p>
+  );
+}
+
 const HEIGHT_PRESETS = [2, 3, 4, 6];
 
 function SlidersIcon() {
@@ -130,12 +201,17 @@ export default function Toolbar({
   onBoardChange,
   view,
   onViewChange,
+  boardPlan,
   onExport,
   exporting,
 }: Props) {
   const set = (patch: Partial<TrayParams>) => onChange({ ...params, ...patch });
   const setBoard = (patch: Partial<SkadisParams>) => onBoardChange({ ...board, ...patch });
   const setView = (patch: Partial<ViewSettings>) => onViewChange({ ...view, ...patch });
+  const label = (kind: "stl" | "step") => {
+    if (exporting?.kind !== kind) return kind === "stl" ? "Export STL" : "Export STEP";
+    return exporting.total > 1 ? `Exporting ${exporting.done + 1}/${exporting.total}…` : "Exporting…";
+  };
 
   return (
     <div className="absolute top-3 left-3 z-10 flex items-center gap-2">
@@ -164,6 +240,55 @@ export default function Toolbar({
                       checked={board.chamfer}
                       onChecked={(v) => setBoard({ chamfer: v })}
                     />
+                    <hr className="border-neutral-800" />
+                    <Toggle
+                      label="Split for printing"
+                      checked={board.bed !== null}
+                      onChecked={(v) => setBoard({ bed: v ? DEFAULT_BED : null })}
+                    />
+                    {board.bed && (
+                      <>
+                        <Field
+                          label="Bed width"
+                          value={board.bed.w}
+                          min={40}
+                          max={1000}
+                          step={10}
+                          unit="mm"
+                          onValue={(v) => setBoard({ bed: { w: v, d: board.bed!.d } })}
+                        />
+                        <Field
+                          label="Bed depth"
+                          value={board.bed.d}
+                          min={40}
+                          max={1000}
+                          step={10}
+                          unit="mm"
+                          onValue={(v) => setBoard({ bed: { w: board.bed!.w, d: v } })}
+                        />
+                        <Choice
+                          label="Seam joint"
+                          value={board.joint}
+                          options={JOINTS}
+                          onValue={(v) => setBoard({ joint: v })}
+                        />
+                        <Field
+                          label="Joint clearance"
+                          value={board.clearance}
+                          min={0}
+                          max={0.6}
+                          step={0.05}
+                          unit="mm"
+                          onValue={(v) => setBoard({ clearance: v })}
+                        />
+                        <SplitReadout plan={boardPlan} bed={board.bed} />
+                        <Toggle
+                          label="Separate pieces"
+                          checked={view.explode}
+                          onChecked={(v) => setView({ explode: v })}
+                        />
+                      </>
+                    )}
                   </>
                 ) : (
                   <>
@@ -261,14 +386,14 @@ export default function Toolbar({
                   disabled={exporting !== null}
                   onClick={() => onExport("stl")}
                 >
-                  {exporting === "stl" ? "Exporting…" : "Export STL"}
+                  {label("stl")}
                 </button>
                 <button
                   className="rounded-md bg-neutral-700 px-3 py-2 text-sm font-medium text-neutral-100 enabled:hover:bg-neutral-600 disabled:opacity-40"
                   disabled={exporting !== null}
                   onClick={() => onExport("step")}
                 >
-                  {exporting === "step" ? "Exporting…" : "Export STEP"}
+                  {label("step")}
                 </button>
               </div>
             </Popover.Popup>

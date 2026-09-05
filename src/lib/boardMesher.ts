@@ -11,8 +11,16 @@
 //   · slot walls and the board's own edge are lofts between rings sampled by
 //     the one `sampleRRect`, so the rings pair up index by index
 //
+// A split board meshes as one piece per print (`boardPieces`), all in the same
+// board coordinates so the printed-look shader and the ghost read across the
+// seams. Splitting costs the paving almost nothing, because the joint rides the
+// checkerboard: the tooth always grows from the tile that has the slot, so a
+// notched tile is always an empty one. Slotted tiles keep the annulus paving
+// untouched, empty notched tiles fall back to earcut, and each tooth is one
+// extra prism outside the tile field. See lib/skadis.ts for the rule.
+//
 // Tile seams are joins inside a flat face, so they carry no edge line; the B-rep
-// edges are the board outline, each slot mouth, the chamfer rings and the
+// edges are the piece outline, each slot mouth, the chamfer rings and the
 // tangent seams where a straight side meets a corner arc.
 //
 // Output frame is the viewer's world: x along columns, y up (mm above the bed),
@@ -23,30 +31,52 @@ import {
   EPS,
   Sink,
   UP,
+  fillPolygon,
   lift,
   loft,
+  normalizePolygon,
   ringStrip,
   sampleRRect,
+  wallLoft,
   type MeshSoup,
   type Outline,
   type Pair,
 } from "./meshKit";
 import {
   SLOT_CHAMFER,
-  boardOutline,
+  boardPieces,
+  boardSplit,
   hasSlot,
   latticeCentre,
   latticeTile,
+  pieceOutline,
+  pieceSizeMm,
+  pieceTileField,
   slotRRect,
-  tileField,
+  tileIsNotched,
+  tilePolygon,
+  tileSeams,
+  toothPolygon,
+  type BoardPiece,
+  type SeamSide,
   type SkadisSpec,
+  type SkadisSplit,
 } from "./skadis";
 
-export interface BoardGeometry extends MeshSoup {
+/** One printable piece, meshed in board coordinates. */
+export interface PieceGeometry extends MeshSoup {
+  piece: BoardPiece;
+  /** Footprint in mm — what the export names and the size readout quote. */
+  size: { w: number; d: number };
+}
+
+export interface BoardGeometry {
   cols: number;
   rows: number;
   /** Top face height in mm — the board's `topZ`, for whatever the viewer hangs off it. */
   topZ: number;
+  /** One entry when the board prints whole; `boardPieces` order otherwise. */
+  pieces: PieceGeometry[];
 }
 
 const BOARD_SEGS = 8; // per quarter arc on the board outline (R8)
@@ -71,32 +101,68 @@ function seams(o: Outline): number[] {
   return idx;
 }
 
-export function buildBoardGeometry(spec: SkadisSpec): BoardGeometry {
-  const { cols, rows } = spec;
-  const h = Math.max(spec.thickness, 0.4);
-  // The chamfer can never eat more than half the panel, however thin it gets.
-  const ch = spec.chamfer ? Math.min(SLOT_CHAMFER, h / 2 - 0.01) : 0;
+/** The seam sides a tile sits on — where it grows a tooth, or takes a notch. */
+function seamSides(p: BoardPiece, c: number, r: number): SeamSide[] {
+  const s = tileSeams(p, c, r);
+  const out: SeamSide[] = [];
+  if (s.x1) out.push("x1");
+  if (s.z1) out.push("z1");
+  if (s.x0) out.push("x0");
+  if (s.z0) out.push("z0");
+  return out;
+}
+
+/** Both faces of one flat plan polygon. */
+function cap(ring: Pair[], h: number, out: Sink) {
+  const poly = normalizePolygon([ring]);
+  fillPolygon(poly, () => h, UP, out);
+  fillPolygon(poly, () => 0, DOWN, out);
+}
+
+function buildPiece(p: BoardPiece, split: SkadisSplit, h: number, ch: number): PieceGeometry {
   const out = new Sink();
+  const outline = pieceOutline(p, split, BOARD_SEGS);
 
-  const outline = boardOutline(cols, rows);
-  const outerO = sampleRRect(outline, BOARD_SEGS);
-  const centre: Pair = [(outline.x0 + outline.x1) / 2, (outline.z0 + outline.z1) / 2];
+  // Border band: the 10mm of plate between the outermost tiles and a real edge.
+  // A seam edge sits on the tile field itself, so the band is zero-width there —
+  // strip against the tooth-less outline and those quads collapse away.
+  if (!p.seamX0 || !p.seamX1 || !p.seamZ0 || !p.seamZ1) {
+    const field = sampleRRect(pieceTileField(p), 0);
+    const band = pieceOutline(p, split, BOARD_SEGS, false);
+    ringStrip(field, band.pts, h, UP, out);
+    ringStrip(field, band.pts, 0, DOWN, out);
+  }
 
-  // Border band: between the rounded outline and the plain rectangle the tiles
-  // pave. `tileField` is the outline inset by half a lattice step, whose corner
-  // radius has gone to zero — so four points describe it exactly.
-  const fieldO = sampleRRect(tileField(cols, rows), 0);
-  ringStrip(fieldO, outerO.pts, h, UP, out);
-  ringStrip(fieldO, outerO.pts, 0, DOWN, out);
+  // The piece's own wall. `loft` takes its normals from a centre point, which a
+  // seam's teeth and sockets make wrong, so every segment carries its own.
+  wallLoft(outline, 0, h, out);
+  out.ringLines(outline, 0);
+  out.ringLines(outline, h);
+  for (const i of outline.verts) out.line(lift(outline.pts[i], 0), lift(outline.pts[i], h));
 
-  // Board edge, its two face outlines and the tangent seams down the corners.
-  loft(outerO, 0, outerO, h, centre, out);
-  out.ringLines(outerO, 0);
-  out.ringLines(outerO, h);
-  for (const t of seams(outerO)) out.line(lift(outerO.pts[t], 0), lift(outerO.pts[t], h));
+  for (let r = p.r0; r <= p.r1; r++) {
+    for (let c = p.c0; c <= p.c1; c++) {
+      const sides = seamSides(p, c, r);
+      if (!hasSlot(c, r)) {
+        if (tileIsNotched(p, c, r)) {
+          const ring = tilePolygon(p, split, c, r);
+          cap([...ring, ring[0]], h, out);
+        } else {
+          const t = latticeTile(c, r);
+          const q: Pair[] = [
+            [t.x0, t.z0],
+            [t.x1, t.z0],
+            [t.x1, t.z1],
+            [t.x0, t.z1],
+          ];
+          out.quad(lift(q[0], h), lift(q[1], h), lift(q[2], h), lift(q[3], h), UP);
+          out.quad(lift(q[0], 0), lift(q[1], 0), lift(q[2], 0), lift(q[3], 0), DOWN);
+        }
+        continue;
+      }
 
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
+      // A slotted tile is always the plain square, whatever the seams around it
+      // do — the parity rule hands it teeth, never notches.
       const t = latticeTile(c, r);
       const corners: Pair[] = [
         [t.x0, t.z0],
@@ -104,12 +170,6 @@ export function buildBoardGeometry(spec: SkadisSpec): BoardGeometry {
         [t.x1, t.z1],
         [t.x0, t.z1],
       ];
-      if (!hasSlot(c, r)) {
-        out.quad(lift(corners[0], h), lift(corners[1], h), lift(corners[2], h), lift(corners[3], h), UP);
-        out.quad(lift(corners[0], 0), lift(corners[1], 0), lift(corners[2], 0), lift(corners[3], 0), DOWN);
-        continue;
-      }
-
       const { x, z } = latticeCentre(c, r);
       const sc: Pair = [x, z];
       // The mouth is what shows on a face: the bore grown by the chamfer.
@@ -127,16 +187,19 @@ export function buildBoardGeometry(spec: SkadisSpec): BoardGeometry {
         out.ringLines(bore, h - ch);
         out.ringLines(bore, ch);
         for (const i of seams(bore)) {
-          const p = bore.pts[i];
+          const pt = bore.pts[i];
           const m = mouth.pts[i];
-          out.line(lift(m, h), lift(p, h - ch));
-          out.line(lift(p, h - ch), lift(p, ch));
-          out.line(lift(p, ch), lift(m, 0));
+          out.line(lift(m, h), lift(pt, h - ch));
+          out.line(lift(pt, h - ch), lift(pt, ch));
+          out.line(lift(pt, ch), lift(m, 0));
         }
       } else {
         loft(mouth, h, mouth, 0, sc, out, true);
         for (const i of seams(mouth)) out.line(lift(mouth.pts[i], 0), lift(mouth.pts[i], h));
       }
+
+      // Its teeth: prisms outside the tile field, so the paving above is untouched.
+      for (const side of sides) cap(toothPolygon(p, split, side, c, r), h, out);
     }
   }
 
@@ -144,9 +207,21 @@ export function buildBoardGeometry(spec: SkadisSpec): BoardGeometry {
     positions: out.pos.result(),
     normals: out.nrm.result(),
     edges: out.lines.result(),
-    cols,
-    rows,
+    piece: p,
+    size: pieceSizeMm(p),
+  };
+}
+
+export function buildBoardGeometry(spec: SkadisSpec): BoardGeometry {
+  const h = Math.max(spec.thickness, 0.4);
+  // The chamfer can never eat more than half the panel, however thin it gets.
+  const ch = spec.chamfer ? Math.min(SLOT_CHAMFER, h / 2 - 0.01) : 0;
+  const split = boardSplit(spec);
+  return {
+    cols: spec.cols,
+    rows: spec.rows,
     topZ: h,
+    pieces: boardPieces(spec.cols, spec.rows, split).map((p) => buildPiece(p, split, h, ch)),
   };
 }
 

@@ -25,7 +25,9 @@ in on split — through swappable presets (see "Transitions").
 compartments. The only edit is dragging an edge to add or remove lattice columns and rows,
 which must stay **odd** (3, 5, 7 …), so the handles step by two. No cell selection, no
 fusing, no transitions — but the same printed look, the same ghost preview while dragging,
-and the same export path.
+and the same export path. A board bigger than the printer can be **split into connectable
+pieces** (Sept 2026): give Settings a bed size and it cuts on lattice boundaries, joining
+the pieces with printed-in jigsaw tabs. See "Connectable boards".
 
 Everything is client-side; there is no backend. Both previews are meshed **procedurally on
 the main thread** (`lib/trayMesher.ts` ~3ms for a 3×2, `lib/boardMesher.ts` ~15ms for the
@@ -80,7 +82,7 @@ Node 24 — a warning, not a failure.
 | `src/components/ModelSwitcher.tsx` | Top-right popover switching tray ↔ board. Switching remounts the canvas, which reframes the camera |
 | `src/components/Toolbar.tsx` | Floating top-left buttons (Base UI `Popover`): Settings — the **active model's** params, then printed look, layer height and the dev-only CAD overlay toggle — and Export (STL / STEP). Popover chrome is in `popoverStyles.ts`, shared with the switcher |
 | `src/components/Viewer.tsx` | The **tray's** R3F canvas: `TrayMesh` (uploads flat-shaded triangles + edge lines; selection-tint, ghost, reveal and printed-look shader patches; applies an animation `pose`), `CellSelector` + the Fuse/Split popup, `EntityMesh` + `TransitionEnd` (animation playback), `CadOverlay` (dev builds: the worker's B-rep edges in red + `window.__compare()`), and `TRAY_METRICS`. The scene shell and the handles come from `viewer/` |
-| `src/components/BoardViewer.tsx` | The board's R3F canvas — the tray Viewer minus everything a board doesn't have. `BoardMesh` (flat-shaded triangles + edge lines, ghost + printed-look patches, its own analytic `topEdgeDist`), the shared handles with `BOARD_METRICS`, the shared scene shell. No selection, no popup, no transitions |
+| `src/components/BoardViewer.tsx` | The board's R3F canvas — the tray Viewer minus everything a board doesn't have. One `BoardMesh` per printable piece (flat-shaded triangles + edge lines, ghost + printed-look patches, its own analytic `topEdgeDist` over the *piece's* outline and slot ranges), wrapped in one group the handles raycast against; the shared handles with `BOARD_METRICS`, the shared scene shell. `ViewSettings.explode` translates the pieces apart. No selection, no popup, no transitions |
 | `src/components/viewer/scene.tsx` | Model-agnostic scene: `MappedControls` (view controls; sets the one-time initial orbit target), `SceneLights`, `GroundGrid` (`section` = the model's pitch), `perspectivePose(w, d)` **in mm**, `groundPoint` |
 | `src/components/viewer/handles.tsx` | The four edge handles, written once for both models: `ResizeHandles3D` + `SizeGrid` (the ground footprint overlay) + the hover/drag visuals. Everything model-specific arrives as a `GridMetrics`; commit on release, camera compensation for left/top resizes |
 | `src/lib/gridMetrics.ts` | `GridMetrics` — pitch, origin, `pad` (how far the shape overhangs its outermost unit boundary), and the allowed counts `min`/`max`/`step` — plus `at`/`lo`/`hi`/`unitAt`/`clampCount`. Tray = `{42, 0, 0, 1..12 step 1}`, board = `{20, 10, 10, 3..37 step 2}` |
@@ -88,18 +90,19 @@ Node 24 — a warning, not a failure.
 | `src/lib/animPresets.ts` | The animation presets (`cellIn`, `explode`, ...): each drives a plain `Pose` with Motion's `animate()`; durations, distances and the slow-motion knob live here |
 | `src/lib/grid.ts` | Pure grid model: `merges: Region[]` (only >1-cell merges stored; uncovered cells are implicit 1×1). `expandSelection` grows a rect over touched merges until stable — spreadsheet semantics. `reframe(state, frame)` re-outlines the grid to a `Frame` (end-exclusive, in the current grid's units, so `c0 < 0` adds columns on the left): merges move with their cells and are clipped at the new bounds |
 | `src/lib/protocol.ts` | The **tray's** spec: `TraySpec`, `Region`, mm constants (incl. `R_OUT`, used by both the worker and the printed-look shader), `traySizeMm()` |
-| `src/lib/workerProtocol.ts` | The UI ↔ worker wire: `ModelKind`, `Job` (`{model, spec}` — the tag picks the builder), `MeshData`, request/response. Separate from `protocol.ts` so it can import both specs without a cycle |
-| `src/lib/skadis.ts` | **The board's `protocol.ts` + `layout.ts` + `grid.ts` in one small file**: the mm constants, `SkadisSpec`, `boardSizeMm`, `boardOutline`, `hasSlot`, `slotCentres`, `slotRRect`, `latticeTile`/`tileField`, `clampBoardUnits`, `reframeBoard` |
+| `src/lib/workerProtocol.ts` | The UI ↔ worker wire: `ModelKind`, `Job` (`{model, spec}` — the tag picks the builder; a skadis job may name one `piece`), `MeshData`, request/response. Separate from `protocol.ts` so it can import both specs without a cycle |
+| `src/lib/skadis.ts` | **The board's `protocol.ts` + `layout.ts` + `grid.ts` in one small file**: the mm constants, `SkadisSpec`, `boardSizeMm`, `boardOutline`, `hasSlot`, `slotCentres`, `slotRRect`, `latticeTile`/`tileField`, `clampBoardUnits`, `reframeBoard` — plus the whole **split** model (see "Connectable boards"): `planSplit`/`boardSplit`, `boardPieces`, `pieceBounds`/`pieceSizeMm`/`pieceFootprintMm`, `toothProfile`, `seamPlace`, `pieceOutline`, `tilePolygon`, `toothPolygon` |
+| `src/lib/zip.ts` | A store-only ZIP writer, ~80 lines and no dependency. A split board exports one STL per piece and firing N downloads at the browser gets a "allow multiple downloads?" prompt; one archive doesn't |
 | `src/lib/layout.ts` | **Single source of truth for every dimension**: `levels()` (topZ / floorZ / dividerTop), `outerOutline`, `pocketRect` (insets + corner radius), foot loft rings, magnet centers, the lip socket profile. Plan coordinates = the viewer's world xz (x along columns, z along rows, row 0 at z 0..42); heights in mm above the bed. Used by the worker, the mesher and (by hand-copied #defines) the shader |
 | `src/lib/meshKit.ts` | **Model-agnostic mesh primitives**, the vocabulary both meshers are written in: `RRect` + `insetRRect`, the one `sampleRRect` (and `CORNERS`), `sampleCircle`, the `Buf`/`Sink` triangle sink (`tri`/`quad`/`line`/`fan`/`ringLines`), `fillPolygon` (earcut), `loft` (with `inward` for hole walls), `ringStrip` (flat annulus), `meshVolume`/`meshBounds`. `layout.ts` and `trayMesher.ts` re-export the pieces their old consumers imported |
-| `src/lib/boardMesher.ts` | Procedural preview mesher for the board — fully analytic, no clipping and no triangulator, because the faces pave a lattice: border band (one `ringStrip` between the R8 outline and the plain rect the tiles pave), one 20mm tile per lattice position (a quad, or a `ringStrip` around its slot), slot walls as 4-ring lofts carrying the chamfer, plus the board's own edge. Tile seams carry no edge line. Dev hook `window.__buildBoard` |
+| `src/lib/boardMesher.ts` | Procedural preview mesher for the board — fully analytic, no clipping and no triangulator, because the faces pave a lattice: border band (one `ringStrip` between the R8 outline and the plain rect the tiles pave), one 20mm tile per lattice position (a quad, or a `ringStrip` around its slot), slot walls as 4-ring lofts carrying the chamfer, plus the piece's own edge (`wallLoft`, not `loft` — a seam makes the outline non-convex). Emits **one soup per printable piece**, all in board coordinates. Tile seams carry no edge line. Dev hook `window.__buildBoard` |
 | `src/lib/printShader.ts` | **The printed look, minus what is being printed**: the uniform bag, the vertex/fragment chunks, `sdRoundRect`, the bead profile and two-stage anti-moiré, the ghost + reveal block, and `patchEdgeMaterial`. Each model supplies one `float topEdgeDist(vec2 p, out vec2 away)` and concatenates |
 | `src/lib/trayMesher.ts` | Procedural preview mesher: emits the tray's *exterior faces* directly — no solid booleans. Wall top = a height field of the inset from the outer outline (`topBands`: rim / chamfer / step / chamfer / socket floor, plus `wall` as a boundary), built as ring-quads near the outline and, for the flat divider network, **per cell** (interior cells analytically: a strip per walled side + a cove per walled corner; boundary cells 2D-clipped with `polygon-clipping`); walls hang off the polygons' edges (classified as pocket / outer / iso-ring); pocket floors, feet lofts, magnet pockets and the underside gaps are analytic. Also emits the B-rep-style edge lines and flat normals. Dev hook `window.__buildTray` |
 | `src/lib/trayParts.ts` | **Part partition** of the mesher's soup into animatable entities (`TrayPart`: foot, cell, divider segment, junction post, outer-wall stretch, tray corner), each an exact tile of the tray; `buildTrayParts(spec)` meshes eagerly and partitions **lazily** (`parts` is a getter, so a drag preview pays for the mesh alone); `PartitionedTray` also carries the merged arrays, which is what renders when nothing animates. See "Parts". Dev hook `window.__buildTrayParts` |
 | `src/lib/viewMapping.ts` | Mouse-button → view-action presets (pure data). Active: `"fusion"` (middle=pan, shift+middle=orbit, wheel=zoom, left/right free) |
 | `src/lib/viewSettings.ts` | Render-only settings (`printLook`, `layerHeight`) + defaults. They never reach the worker — a change must not trigger a rebuild |
 | `src/lib/cadClient.ts` | Worker singleton, promise-per-request (takes a `Job`), `downloadBlob` |
-| `src/workers/cad.worker.ts` | **Export geometry** (and the dev overlay's mesh), for both models — one worker, one WASM instance. `buildTray(spec)`: feet loft → body extrude → fuse → pocket cuts → lip socket cut → magnet cuts. `buildBoard(spec)`: plate extrude, minus one lofted tool per slot (mouth → bore → bore → mouth, so the chamfer comes out of the same operation), all cut as **one compound**. Both pure, all numbers from `layout.ts` / `skadis.ts`. STL + STEP from the same BRep. Loads its WASM lazily, on the first export |
+| `src/workers/cad.worker.ts` | **Export geometry** (and the dev overlay's mesh), for both models — one worker, one WASM instance. `buildTray(spec)`: feet loft → body extrude → fuse → pocket cuts → lip socket cut → magnet cuts. `buildBoard(spec, piece?)`: per piece, a 2D `pieceDrawing` (rectangle − corner slivers + teeth − sockets) extruded, minus one lofted tool per slot (mouth → bore → bore → mouth, so the chamfer comes out of the same operation), all cut as **one compound**; without `piece` every piece comes back as one compound, which is what a STEP wants. Both pure, all numbers from `layout.ts` / `skadis.ts`. STL + STEP from the same BRep. Loads its WASM lazily, on the first export |
 
 **Preview cost** (main thread, per change, mesh + partition): ~6ms at 3×2, ~120ms at
 12×12 with lip + magnets (mesher ~70ms: the per-cell wall tops run edge classification
@@ -111,7 +114,9 @@ The worker holds **no state** between requests; an export rebuilds the whole tra
 
 **Board cost** is a different shape: the mesher is analytic and has no partition pass, so
 ~4ms at 3×3 and ~15ms at 17×27 (the biggest real board, 229 slots, ~64k triangles) — it
-never needs debouncing. The *export* is the slow half, because OpenCASCADE does the work:
+never needs debouncing. Splitting barely moves it: 37×27 cut into twelve pieces meshes in
+~33ms (165k triangles), and `planSplit` costs nothing because it tests one extent array per
+axis rather than building every candidate piece. The *export* is the slow half, because OpenCASCADE does the work:
 ~0.3s at 3×3, ~1.5s at 9×9, ~14s at 17×27 (5s building, 9s meshing the STL). Nothing is
 gated on size; see the chamfer note in "Gotchas" for why it isn't much worse.
 
@@ -186,6 +191,53 @@ From IKEA's own drawing, cross-checked against the product photo:
 - Verified: preview mesher vs CAD kernel agree to **<0.01%** by signed volume across
   chamfered and unchamfered boards; a 3×3 STL exported in the browser measures exactly
   80 × 80 × 5, a 17×27 measures 360 × 560 × 5.
+
+## Connectable boards (`skadis.ts` split model)
+
+A board bigger than the print bed is cut into pieces that clip back together. Settings
+takes the **bed size**; the cuts are *derived* from it (`boardSplit` → `planSplit`), never
+stored, so a resize re-plans for free and the bed stays the only state.
+
+- **Where a cut can go.** Only on a 20mm tile boundary — `MARGIN − LATTICE/2 + LATTICE·k`,
+  which is exactly `BOARD_METRICS`' unit boundary. Each piece then keeps a **10mm** margin
+  at the seam against the usual 20 at a real edge, so the lattice pitch across the join is
+  exact and no slot is bisected. Halving a 15-column board gives **170 + 150, not 160/160**:
+  160 is a slot centre column.
+- **The joint rides the checkerboard.** Across a seam the two facing tiles always have
+  opposite parity, so at every row exactly one side has a slot — and **the slotted tile
+  grows the tooth, the empty tile opposite takes the notch**. Ownership is therefore purely
+  local (`hasSlot` of the piece's own adjacent tile) and neighbours agree without consulting
+  each other. Two consequences worth keeping: the slotted tile keeps its full 7.5mm of solid
+  between slot and seam (notching there would leave 2.5mm), and **no tile ever carries a slot
+  and a notch at once**, which is what lets the mesher keep paving one hole per tile. Getting
+  this backwards still *looks* like a joint — it just moves the notch onto the thin side and
+  forces earcut-with-holes on slotted tiles.
+- **Two profiles**, both 2D prisms so both print with no overhang, both `TOOTH_DEPTH = 5`
+  deep: `jigsaw` (an ellipse 2.8 × 4.5 whose centre sits 2.2 past the seam, so the seam line
+  cuts it at a 5.6 chord — head 9 across, undercut 1.7/side) and `dovetail` (root 7, tip 11).
+  Jigsaw engages **normal to the panel**, the same direction on every seam, so a 2×2 tiling
+  drops together in any order; a dovetail only slides along its seam, so two perpendicular
+  dovetail seams cannot both be assembled — it is the better joint for a **1-D split only**.
+  Sockets are the same profile grown by `clearance` (0.15/face by default); a trapezoid's
+  flanks offset perpendicular to themselves, hence `DOVETAIL_FLANK`.
+- **The teeth stand proud.** A piece's *outline* is `pieceSizeMm`, but what the bed must
+  clear is `pieceFootprintMm` — outline plus `TOOTH_DEPTH` on every seam edge. `planSplit`
+  and the Settings readout both use the footprint; a 15×11 on a 250×220 bed is two pieces
+  measuring **175×240 and 155×240**, which is what the exported STL measures.
+- **`pieceOutline`** walks in `sampleRRect`'s order (right +z, bottom −x, left −z, top +x)
+  so `outward()` gives the true normal even where a tooth makes the ring non-convex, and R8
+  corners appear only where two real edges meet. Everything on a seam — outline, socket in
+  `tilePolygon`, tooth cap in `toothPolygon` — goes through the one `seamPlace`, so the wall
+  and the cap it closes are built from identical floats.
+- **Export.** STEP is one file with the pieces as a compound, still in the assembled frame,
+  so it opens as the board it builds. STL is one solid per file, zipped (`lib/zip.ts`).
+  Filenames carry the footprint. Cost is roughly the whole-board cost split across pieces:
+  a 15×11 in two pieces exports in ~3.3s.
+- Verified: split volume equals unsplit volume to **~1e-5 mm³** at zero clearance (teeth and
+  sockets cancel piece to piece — a strong check on ownership, winding and cap closure);
+  mesher vs CAD agree to **0.001%** across 1-D, 2-D, jigsaw and dovetail splits, checked
+  both in node and in the browser via `__compareBoard()`; the exported STLs measure
+  175 × 240 × 5 and 155 × 240 × 5.
 
 ## 3D view conventions (Viewer.tsx + viewer/)
 
@@ -478,6 +530,17 @@ are model-agnostic and would work unchanged.
   fused then cut **8.5s**; the same tools cut as **one `makeCompound`** — no fuse, they are
   disjoint — **5s**. OpenCASCADE prices chamfers per edge, and there are four per slot.
   Total export for that board is ~14s (the STL meshing is the other half); a 3×3 is 0.3s.
+- **A socket points the other way.** In the mesher a socket is the tooth profile with `out`
+  negated; in the CAD it is the same drawing rotated **180° past the outward direction**.
+  Rotating it outward like the tooth cuts only the sliver behind the seam line, which leaves
+  every tooth overlapping its neighbour — the split board then meshes ~1% *heavier* than the
+  unsplit one. That number is the tell, and `__compareBoard()` catches it immediately.
+- **Checking the CAD from node** needs three things, because `cad.worker.ts` is a worker
+  module: preload a `self` stub (`tsx --require ./stub.cjs`, not an import — imports hoist
+  above the assignment), keep the script **CJS** (a `.mts` entry loads `replicad` a second
+  time through the ESM loader and `setOC` then sets the wrong singleton, giving
+  "oppencascade has not been loaded"), and run it from the repo root so `node_modules`
+  resolves. Volume + bounds against `buildBoardGeometry` is the whole test.
 - `sampleRRect(rr, 0)` means "the four corners alone" — the `segs || 1` guard exists
   because `i / segs` was NaN at 0. The board's tile field is a zero-radius rect, so this is
   the sampling it wants; passing a nonzero `segs` there just makes duplicate points.

@@ -1,12 +1,14 @@
 import initOpenCascade from "replicad-opencascadejs";
 import {
   setOC,
+  draw,
   drawCircle,
+  drawEllipse,
   drawRectangle,
-  drawRoundedRectangle,
   makeCompound,
   sketchRoundedRectangle,
   makeCylinder,
+  type Drawing,
   type Shape3D,
   type Sketch,
 } from "replicad";
@@ -14,13 +16,26 @@ import { PITCH, BASE_H, type TraySpec } from "../lib/protocol";
 import type { WorkerRequest, WorkerResponse } from "../lib/workerProtocol";
 import {
   BOARD_R,
+  DOVETAIL,
+  DOVETAIL_FLANK,
+  JIGSAW,
   SLOT_CHAMFER,
   SLOT_H,
   SLOT_R,
   SLOT_W,
+  TOOTH_DEPTH,
+  boardPieces,
   boardSizeMm,
+  boardSplit,
+  hasSlot,
+  latticeCentre,
+  pieceBounds,
   slotCentres,
+  type BoardPiece,
+  type JointKind,
+  type SeamSide,
   type SkadisSpec,
+  type SkadisSplit,
 } from "../lib/skadis";
 import {
   FOOT_RINGS,
@@ -166,32 +181,142 @@ function slotDrawing(grow: number) {
  *
  * Same frame mapping as the tray: plan x → OCC x, plan z → OCC y = d − z.
  */
-export function buildBoard(spec: SkadisSpec): Shape3D {
-  const { w, d, h } = boardSizeMm(spec);
-  const plate = (
-    drawRoundedRectangle(w, d, BOARD_R).translate(w / 2, d / 2).sketchOnPlane("XY") as Sketch
-  ).extrude(h) as Shape3D;
+/**
+ * One tooth as a 2D drawing pointing +x from the origin, `grow` bigger on every
+ * face (that is the socket). Neither shape needs clipping to the seam line: the
+ * part behind it is inside the plate, so fusing or cutting the whole thing lands
+ * the same solid — and it keeps the arc exact instead of sampled.
+ */
+function toothDrawing(joint: JointKind, grow: number): Drawing {
+  if (joint === "dovetail") {
+    const root = DOVETAIL.root + grow * DOVETAIL_FLANK;
+    const tip = DOVETAIL.tip + grow * DOVETAIL_FLANK;
+    const d = TOOTH_DEPTH + grow;
+    return draw([0, -root]).lineTo([d, -tip]).lineTo([d, tip]).lineTo([0, root]).close();
+  }
+  return drawEllipse(JIGSAW.ax + grow, JIGSAW.az + grow).translate(JIGSAW.dc, 0);
+}
+
+/** The sliver an R8 corner removes: the corner square minus its quarter disc. */
+function cornerTool(sx: number, sy: number, ax: number, ay: number): Drawing {
+  const r = BOARD_R;
+  return drawRectangle(r, r)
+    .translate(sx, sy)
+    .cut(drawCircle(r).translate(ax, ay));
+}
+
+/**
+ * A piece's plan outline as one 2D drawing in the worker's XY frame: the plain
+ * rectangle, minus a corner sliver where two real edges meet (a seam corner
+ * stays square), plus the teeth it owns and minus the sockets it doesn't. Doing
+ * the joint in 2D and extruding once is far cheaper than 3D booleans, and the
+ * ownership rule is local — `hasSlot` of the piece's own adjacent tile.
+ */
+function pieceDrawing(split: SkadisSplit, p: BoardPiece, d: number): Drawing {
+  const b = pieceBounds(p);
+  const y = (z: number) => d - z; // plan z -> OCC y
+  const r = BOARD_R / 2;
+  let dr = drawRectangle(b.x1 - b.x0, b.z1 - b.z0).translate(
+    (b.x0 + b.x1) / 2,
+    y((b.z0 + b.z1) / 2),
+  );
+
+  const round: [boolean, number, number, number, number][] = [
+    [!p.seamX1 && !p.seamZ0, b.x1 - r, y(b.z0 + r), b.x1 - BOARD_R, y(b.z0 + BOARD_R)],
+    [!p.seamX1 && !p.seamZ1, b.x1 - r, y(b.z1 - r), b.x1 - BOARD_R, y(b.z1 - BOARD_R)],
+    [!p.seamX0 && !p.seamZ1, b.x0 + r, y(b.z1 - r), b.x0 + BOARD_R, y(b.z1 - BOARD_R)],
+    [!p.seamX0 && !p.seamZ0, b.x0 + r, y(b.z0 + r), b.x0 + BOARD_R, y(b.z0 + BOARD_R)],
+  ];
+  for (const [real, sx, sy, ax, ay] of round) if (real) dr = dr.cut(cornerTool(sx, sy, ax, ay));
+
+  // Outward direction of each seam, as an OCC rotation of the canonical +x tooth.
+  const sides: [SeamSide, boolean, number, () => { c: number; r: number }[]][] = [
+    ["x1", p.seamX1, 0, () => rows(p).map((r2) => ({ c: p.c1, r: r2 }))],
+    ["x0", p.seamX0, 180, () => rows(p).map((r2) => ({ c: p.c0, r: r2 }))],
+    ["z1", p.seamZ1, -90, () => cols(p).map((c2) => ({ c: c2, r: p.r1 }))],
+    ["z0", p.seamZ0, 90, () => cols(p).map((c2) => ({ c: c2, r: p.r0 }))],
+  ];
+  for (const [side, on, angle, tiles] of sides) {
+    if (!on) continue;
+    for (const { c, r: rr } of tiles()) {
+      const own = hasSlot(c, rr);
+      const centre = latticeCentre(c, rr);
+      const at: [number, number] =
+        side === "x1"
+          ? [b.x1, y(centre.z)]
+          : side === "x0"
+            ? [b.x0, y(centre.z)]
+            : side === "z1"
+              ? [centre.x, y(b.z1)]
+              : [centre.x, y(b.z0)];
+      // A tooth points out of the piece; a socket is the same profile pointing
+      // back into it, which is the half-turn the mesher writes as `-out`.
+      const tool = toothDrawing(split.joint, own ? 0 : split.clearance)
+        .rotate(own ? angle : angle + 180)
+        .translate(at[0], at[1]);
+      dr = own ? dr.fuse(tool) : dr.cut(tool);
+    }
+  }
+  return dr;
+}
+
+const rows = (p: BoardPiece) =>
+  Array.from({ length: p.r1 - p.r0 + 1 }, (_, i) => p.r0 + i);
+const cols = (p: BoardPiece) =>
+  Array.from({ length: p.c1 - p.c0 + 1 }, (_, i) => p.c0 + i);
+
+/**
+ * A SKÅDIS board: one extruded plate per printable piece, minus one cut tool per
+ * slot, the tool lofted mouth -> bore -> bore -> mouth so the 1mm chamfer comes
+ * out of the same operation. The outermost rings sit a hair past each face at
+ * `c + e`, so the 45 degree flank continues through the surface and the mouth is
+ * exactly `c` wide there.
+ *
+ * The tools are cut as **one compound**, not fused first: they are disjoint, so
+ * the fuse only costs time (measured on a 17x27 board, 229 slots — 5s with a
+ * compound against 8.5s via `fuseAll`). Both beat chamfering the finished solid
+ * with `.chamfer()` by a wide margin: that took 55s on the same board, because
+ * OpenCASCADE prices chamfers per edge and there are four per slot.
+ *
+ * `which` selects one piece; without it every piece comes back as one compound,
+ * which is what a STEP export wants. Pieces stay in the assembled frame, so a
+ * multi-piece STEP opens as the board it builds.
+ *
+ * Same frame mapping as the tray: plan x -> OCC x, plan z -> OCC y = d - z.
+ */
+export function buildBoard(spec: SkadisSpec, which?: number): Shape3D {
+  const { d, h } = boardSizeMm(spec);
+  const split = boardSplit(spec);
+  const all = boardPieces(spec.cols, spec.rows, split);
+  const wanted = which === undefined ? all : [all[which]];
 
   const e = 0.01; // overshoot past each face, so the cut leaves no skin
   const c = spec.chamfer ? Math.min(SLOT_CHAMFER, h / 2 - e) : 0;
   const bore = slotDrawing(0);
   const mouth = c > 0 ? slotDrawing(c + e) : bore;
 
-  const tools = slotCentres(spec.cols, spec.rows).map((s) => {
-    const at = (dr: typeof bore, z: number) =>
-      dr.translate(s.x, d - s.z).sketchOnPlane("XY", z) as Sketch;
-    if (c === 0) return at(bore, -e).extrude(h + 2 * e) as Shape3D;
-    return at(mouth, -e).loftWith([at(bore, c), at(bore, h - c), at(mouth, h + e)], {
-      ruled: true,
-    }) as Shape3D;
+  const solids = wanted.map((p) => {
+    const plate = (pieceDrawing(split, p, d).sketchOnPlane("XY") as Sketch).extrude(h) as Shape3D;
+    const tools = slotCentres(spec.cols, spec.rows)
+      .filter((s) => s.c >= p.c0 && s.c <= p.c1 && s.r >= p.r0 && s.r <= p.r1)
+      .map((s) => {
+        const at = (dr: typeof bore, z: number) =>
+          dr.translate(s.x, d - s.z).sketchOnPlane("XY", z) as Sketch;
+        if (c === 0) return at(bore, -e).extrude(h + 2 * e) as Shape3D;
+        return at(mouth, -e).loftWith([at(bore, c), at(bore, h - c), at(mouth, h + e)], {
+          ruled: true,
+        }) as Shape3D;
+      });
+    return tools.length > 0 ? plate.cut(makeCompound(tools) as Shape3D) : plate;
   });
-  return tools.length > 0 ? plate.cut(makeCompound(tools) as Shape3D) : plate;
+  return solids.length === 1 ? solids[0] : (makeCompound(solids) as Shape3D);
 }
 
 async function handle(req: WorkerRequest): Promise<WorkerResponse> {
   try {
     await init();
-    const tray = req.model === "skadis" ? buildBoard(req.spec) : buildTray(req.spec);
+    const tray =
+      req.model === "skadis" ? buildBoard(req.spec, req.piece) : buildTray(req.spec);
     if (req.type === "mesh") {
       const m = tray.mesh({ tolerance: 0.05, angularTolerance: 20 });
       const e = tray.meshEdges({ tolerance: 0.05, angularTolerance: 20 });
