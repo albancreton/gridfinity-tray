@@ -212,18 +212,23 @@ stored, so a resize re-plans for free and the bed stays the only state.
   and a notch at once**, which is what lets the mesher keep paving one hole per tile. Getting
   this backwards still *looks* like a joint — it just moves the notch onto the thin side and
   forces earcut-with-holes on slotted tiles.
-- **Two profiles**, both 2D prisms so both print with no overhang, both `TOOTH_DEPTH = 5`
-  deep: `jigsaw` (an ellipse 2.8 × 4.5 whose centre sits 2.2 past the seam, so the seam line
-  cuts it at a 5.6 chord — head 9 across, undercut 1.7/side) and `dovetail` (root 7, tip 11).
+- **Two profiles**, both 2D prisms so both print with no overhang. `jigsaw` is drawn from a
+  single radius `JIGSAW_R` = 1.25: four arcs, all R, making a tab **8R along the seam, 3R
+  deep, on a 4R neck** — a concave fillet out of the seam line, the head's semicircular cap,
+  a flat tip, then the mirror. Head twice the neck is **2R of undercut per side**.
+  `dovetail` is root 7, tip 11, 5 deep. Depth is therefore per profile (`toothDepth(joint)`),
+  which `pieceFootprintMm` and `planSplit` both need.
   Jigsaw engages **normal to the panel**, the same direction on every seam, so a 2×2 tiling
   drops together in any order; a dovetail only slides along its seam, so two perpendicular
   dovetail seams cannot both be assembled — it is the better joint for a **1-D split only**.
-  Sockets are the same profile grown by `clearance` (0.15/face by default); a trapezoid's
-  flanks offset perpendicular to themselves, hence `DOVETAIL_FLANK`.
+  Sockets are the same profile grown by `clearance` (0.15/face by default). Offsetting is the
+  one subtlety: a **convex** arc grows with the offset and a **concave** one shrinks, and a
+  trapezoid's flanks move perpendicular to themselves, hence `DOVETAIL_FLANK`.
 - **The teeth stand proud.** A piece's *outline* is `pieceSizeMm`, but what the bed must
-  clear is `pieceFootprintMm` — outline plus `TOOTH_DEPTH` on every seam edge. `planSplit`
-  and the Settings readout both use the footprint; a 15×11 on a 250×220 bed is two pieces
-  measuring **175×240 and 155×240**, which is what the exported STL measures.
+  clear is `pieceFootprintMm` — outline plus `toothDepth(joint)` on every seam edge.
+  `planSplit` and the Settings readout both use the footprint; a 15×11 on a 250×220 bed is
+  two pieces measuring **173.75×240 and 153.75×240**, which is what the exported STL
+  measures. Fitting the outline instead silently plans splits that overhang the bed.
 - **`pieceOutline`** walks in `sampleRRect`'s order (right +z, bottom −x, left −z, top +x)
   so `outward()` gives the true normal even where a tooth makes the ring non-convex, and R8
   corners appear only where two real edges meet. Everything on a seam — outline, socket in
@@ -235,9 +240,9 @@ stored, so a resize re-plans for free and the bed stays the only state.
   a 15×11 in two pieces exports in ~3.3s.
 - Verified: split volume equals unsplit volume to **~1e-5 mm³** at zero clearance (teeth and
   sockets cancel piece to piece — a strong check on ownership, winding and cap closure);
-  mesher vs CAD agree to **0.001%** across 1-D, 2-D, jigsaw and dovetail splits, checked
-  both in node and in the browser via `__compareBoard()`; the exported STLs measure
-  175 × 240 × 5 and 155 × 240 × 5.
+  mesher vs CAD agree to **≤0.0014%** across 1-D, 2-D, jigsaw and dovetail splits, checked
+  both in node and in the browser via `__compareBoard()` (0.0002% on the live 15×11); the
+  exported STLs measure 173.75 × 240 × 5 and 153.75 × 240 × 5.
 
 ## 3D view conventions (Viewer.tsx + viewer/)
 

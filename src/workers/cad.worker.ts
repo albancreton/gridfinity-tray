@@ -3,7 +3,6 @@ import {
   setOC,
   draw,
   drawCircle,
-  drawEllipse,
   drawRectangle,
   makeCompound,
   sketchRoundedRectangle,
@@ -18,12 +17,11 @@ import {
   BOARD_R,
   DOVETAIL,
   DOVETAIL_FLANK,
-  JIGSAW,
+  JIGSAW_R,
   SLOT_CHAMFER,
   SLOT_H,
   SLOT_R,
   SLOT_W,
-  TOOTH_DEPTH,
   boardPieces,
   boardSizeMm,
   boardSplit,
@@ -191,10 +189,22 @@ function toothDrawing(joint: JointKind, grow: number): Drawing {
   if (joint === "dovetail") {
     const root = DOVETAIL.root + grow * DOVETAIL_FLANK;
     const tip = DOVETAIL.tip + grow * DOVETAIL_FLANK;
-    const d = TOOTH_DEPTH + grow;
+    const d = DOVETAIL.depth + grow;
     return draw([0, -root]).lineTo([d, -tip]).lineTo([d, tip]).lineTo([0, root]).close();
   }
-  return drawEllipse(JIGSAW.ax + grow, JIGSAW.az + grow).translate(JIGSAW.dc, 0);
+  // Same four arcs as `toothProfile`, but exact: three-point arcs, so the STEP
+  // carries real circles rather than the mesher's sampling.
+  const R = JIGSAW_R;
+  const cap = R + grow;
+  const fil = Math.max(0.05, R - grow);
+  const k = Math.SQRT1_2;
+  return draw([0, -(3 * R - fil)])
+    .threePointsArcTo([fil, -3 * R], [fil * k, -3 * R + fil * k])
+    .threePointsArcTo([2 * R + cap, -3 * R], [2 * R, -3 * R - cap])
+    .lineTo([2 * R + cap, 3 * R])
+    .threePointsArcTo([fil, 3 * R], [2 * R, 3 * R + cap])
+    .threePointsArcTo([0, 3 * R - fil], [fil * k, 3 * R - fil * k])
+    .close();
 }
 
 /** The sliver an R8 corner removes: the corner square minus its quarter disc. */

@@ -186,34 +186,40 @@ export function reframeBoard(frame: Frame): SkadisState {
 /** How a seam interlocks. Both are 2D prisms, so both print with no overhang. */
 export type JointKind = "jigsaw" | "dovetail";
 
-/** How far a tooth reaches into its neighbour. 5 leaves 7.5mm of solid to the slot. */
-export const TOOTH_DEPTH = 5;
 /**
- * Oval-headed tab, `dc + ax = TOOTH_DEPTH`: head 9 across, neck 5.6, undercut
- * 1.7 per side. The head is a full ellipse whose centre sits `dc` past the seam,
- * so the seam line cuts it at a chord narrower than the head — that chord is the
- * undercut, and it is why the CAD can fuse (or cut) the whole ellipse without
- * clipping: everything behind the seam is inside the plate already.
+ * The jigsaw tab is drawn from a single radius: every one of its four arcs is
+ * `JIGSAW_R`, and the tab is **8R along the seam, 3R deep, on a 4R neck** — so
+ * the head is twice the neck, 2R of undercut per side. Walking it from one root
+ * corner: a concave fillet out of the seam line, the head's semicircular cap, a
+ * flat tip, then the mirror.
  */
-export const JIGSAW = { ax: 2.8, az: 4.5, dc: TOOTH_DEPTH - 2.8 };
-/** Straight-flanked dovetail: 7 wide at the seam, 11 at the tip. */
-export const DOVETAIL = { root: 3.5, tip: 5.5 };
+export const JIGSAW_R = 1.25;
+const JIGSAW_SEGS = 6; // per quarter arc
+/** Straight-flanked dovetail: 7 wide at the seam, 11 at the tip, 5 deep. */
+export const DOVETAIL = { root: 3.5, tip: 5.5, depth: 5 };
 /** A trapezoid's flanks offset perpendicular to themselves, not sideways. */
-export const DOVETAIL_FLANK = Math.hypot(TOOTH_DEPTH, DOVETAIL.tip - DOVETAIL.root) / TOOTH_DEPTH;
-const TOOTH_SEGS = 20;
+export const DOVETAIL_FLANK =
+  Math.hypot(DOVETAIL.depth, DOVETAIL.tip - DOVETAIL.root) / DOVETAIL.depth;
+
+/** How far a tooth of this profile reaches into its neighbour. */
+export function toothDepth(joint: JointKind): number {
+  return joint === "dovetail" ? DOVETAIL.depth : 3 * JIGSAW_R;
+}
 
 /**
  * One tooth as offsets from its centre on the seam line: `[out, along]`, where
  * `out` runs into the neighbouring piece and `along` runs down the seam,
- * ordered ascending. `grow` offsets it on every face, which is how the socket is
- * cut — the male tooth is nominal and the female socket is grown by the
- * clearance, so the fit is tuned from one number.
+ * ordered from one root corner to the other. `grow` offsets it on every face,
+ * which is how the socket is cut — the male tooth is nominal and the female
+ * socket is grown by the clearance, so the fit is tuned from one number. A
+ * convex arc grows with the offset and a concave one shrinks, which is the only
+ * subtlety here.
  */
 export function toothProfile(joint: JointKind, grow = 0): Pair[] {
   if (joint === "dovetail") {
     const root = DOVETAIL.root + grow * DOVETAIL_FLANK;
     const tip = DOVETAIL.tip + grow * DOVETAIL_FLANK;
-    const d = TOOTH_DEPTH + grow;
+    const d = DOVETAIL.depth + grow;
     return [
       [0, -root],
       [d, -tip],
@@ -221,15 +227,25 @@ export function toothProfile(joint: JointKind, grow = 0): Pair[] {
       [0, root],
     ];
   }
-  // The head is an ellipse whose centre sits `dc` past the seam, so the seam line
-  // cuts it at a chord narrower than the head — that chord is the undercut.
-  const ax = JIGSAW.ax + grow;
-  const az = JIGSAW.az + grow;
-  const t1 = Math.acos(-JIGSAW.dc / ax);
-  return Array.from({ length: TOOTH_SEGS + 1 }, (_, i) => {
-    const t = -t1 + (2 * t1 * i) / TOOTH_SEGS;
-    return [JIGSAW.dc + ax * Math.cos(t), az * Math.sin(t)] as Pair;
-  });
+  const R = JIGSAW_R;
+  const cap = R + grow;
+  const fil = Math.max(0.05, R - grow);
+  const pts: Pair[] = [];
+  // Consecutive arcs share an endpoint, so every arc after the first skips its
+  // own start — a repeated point would make a zero-length segment in the wall.
+  const arc = (cx: number, ca: number, r: number, a0: number, a1: number, quarters: number) => {
+    const n = JIGSAW_SEGS * quarters;
+    for (let i = pts.length ? 1 : 0; i <= n; i++) {
+      const t = a0 + ((a1 - a0) * i) / n;
+      pts.push([cx + r * Math.cos(t), ca + r * Math.sin(t)]);
+    }
+  };
+  const Q = Math.PI / 2;
+  arc(0, -3 * R, fil, Q, 0, 1); // fillet out of the seam line
+  arc(2 * R, -3 * R, cap, Math.PI, 2 * Math.PI, 2); // head
+  arc(2 * R, 3 * R, cap, 0, Math.PI, 2); // head, mirrored — the flat tip is the join
+  arc(0, 3 * R, fil, 0, -Q, 1);
+  return pts;
 }
 
 /** A neutral starting bed when splitting is switched on; most hobby printers clear it. */
@@ -320,11 +336,12 @@ export function pieceSizeMm(p: BoardPiece): { w: number; d: number } {
  * which reach `TOOTH_DEPTH` past every seam edge. This — not `pieceSizeMm` — is
  * what the bed has to clear, and what a slicer will report.
  */
-export function pieceFootprintMm(p: BoardPiece): { w: number; d: number } {
+export function pieceFootprintMm(p: BoardPiece, joint: JointKind): { w: number; d: number } {
   const s = pieceSizeMm(p);
+  const t = toothDepth(joint);
   return {
-    w: s.w + (p.seamX0 ? TOOTH_DEPTH : 0) + (p.seamX1 ? TOOTH_DEPTH : 0),
-    d: s.d + (p.seamZ0 ? TOOTH_DEPTH : 0) + (p.seamZ1 ? TOOTH_DEPTH : 0),
+    w: s.w + (p.seamX0 ? t : 0) + (p.seamX1 ? t : 0),
+    d: s.d + (p.seamZ0 ? t : 0) + (p.seamZ1 ? t : 0),
   };
 }
 
@@ -346,10 +363,10 @@ const fits = (w: number, d: number, bed: { w: number; d: number }) =>
  * outline. Per axis only, because a piece's width depends on the column grouping
  * alone — which is what keeps the search below cheap.
  */
-function runExtents(count: number, groups: number): number[] {
+function runExtents(count: number, groups: number, joint: JointKind): number[] {
   const base = Math.floor(count / groups);
   const extra = count % groups;
-  const end = (edge: boolean) => (edge ? MARGIN - LATTICE / 2 : TOOTH_DEPTH);
+  const end = (edge: boolean) => (edge ? MARGIN - LATTICE / 2 : toothDepth(joint));
   return Array.from({ length: groups }, (_, i) => {
     const n = base + (i < extra ? 1 : 0);
     return LATTICE * n + end(i === 0) + end(i === groups - 1);
@@ -366,13 +383,14 @@ export function planSplit(
   cols: number,
   rows: number,
   bed: { w: number; d: number },
+  joint: JointKind,
 ): { cutsC: number[]; cutsR: number[] } {
   let best: { m: number; n: number } | null = null;
   for (let m = 1; m <= cols; m++) {
-    const ws = runExtents(cols, m);
+    const ws = runExtents(cols, m, joint);
     for (let n = 1; n <= rows; n++) {
       if (best && m * n >= best.m * best.n) continue;
-      const ds = runExtents(rows, n);
+      const ds = runExtents(rows, n, joint);
       if (ws.every((w) => ds.every((d) => fits(w, d, bed)))) best = { m, n };
     }
   }
@@ -385,7 +403,7 @@ export function planSplit(
 export function boardSplit(spec: SkadisSpec): SkadisSplit {
   const base = { joint: spec.joint, clearance: spec.clearance };
   if (!spec.bed) return { cutsC: [], cutsR: [], ...base };
-  return { ...planSplit(spec.cols, spec.rows, spec.bed), ...base };
+  return { ...planSplit(spec.cols, spec.rows, spec.bed, spec.joint), ...base };
 }
 
 /** A piece's outline, plus the vertices that carry a real vertical edge line. */

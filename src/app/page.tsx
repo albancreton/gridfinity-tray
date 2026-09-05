@@ -122,7 +122,7 @@ export default function Home() {
   // when the board prints whole. Both the Settings readout and the export loop
   // run off it.
   const boardPlan = useMemo(
-    () => boardPieces(boardSpec.cols, boardSpec.rows, boardSplit(boardSpec)).map(pieceFootprintMm),
+    () => boardPieces(boardSpec.cols, boardSpec.rows, boardSplit(boardSpec)).map((p) => pieceFootprintMm(p, boardSpec.joint)),
     [boardSpec],
   );
   // The preview is meshed synchronously from the layout and partitioned into
