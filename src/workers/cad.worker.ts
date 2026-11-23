@@ -15,8 +15,6 @@ import { PITCH, BASE_H, type TraySpec } from "../lib/protocol";
 import type { WorkerRequest, WorkerResponse } from "../lib/workerProtocol";
 import {
   BOARD_R,
-  DOVETAIL,
-  DOVETAIL_FLANK,
   JIGSAW_R,
   SLOT_CHAMFER,
   SLOT_H,
@@ -25,6 +23,7 @@ import {
   boardPieces,
   boardSizeMm,
   boardSplit,
+  dovetailFillets,
   hasSlot,
   latticeCentre,
   pieceBounds,
@@ -187,10 +186,11 @@ function slotDrawing(grow: number) {
  */
 function toothDrawing(joint: JointKind, grow: number): Drawing {
   if (joint === "dovetail") {
-    const root = DOVETAIL.root + grow * DOVETAIL_FLANK;
-    const tip = DOVETAIL.tip + grow * DOVETAIL_FLANK;
-    const d = DOVETAIL.depth + grow;
-    return draw([0, -root]).lineTo([d, -tip]).lineTo([d, tip]).lineTo([0, root]).close();
+    // The same four fillets the mesher samples, drawn as exact arcs.
+    const [f0, ...rest] = dovetailFillets(grow);
+    let pen = draw(f0.t0).threePointsArcTo(f0.t1, f0.mid);
+    for (const f of rest) pen = pen.lineTo(f.t0).threePointsArcTo(f.t1, f.mid);
+    return pen.close();
   }
   // Same four arcs as `toothProfile`, but exact: three-point arcs, so the STEP
   // carries real circles rather than the mesher's sampling.

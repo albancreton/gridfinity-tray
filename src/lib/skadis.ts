@@ -195,11 +195,93 @@ export type JointKind = "jigsaw" | "dovetail";
  */
 export const JIGSAW_R = 1.25;
 const JIGSAW_SEGS = 6; // per quarter arc
-/** Straight-flanked dovetail: 7 wide at the seam, 11 at the tip, 5 deep. */
-export const DOVETAIL = { root: 3.5, tip: 5.5, depth: 5 };
+/**
+ * Straight-flanked dovetail: 7 wide at the seam, 11 at the tip, 5 deep, with
+ * every corner rounded by `fillet` — the two concave roots and the two convex
+ * tip corners. A sharp inside corner is where a nozzle overshoots and a sharp
+ * tooth corner is what curls, so the rounding is for the printer, not the look.
+ */
+export const DOVETAIL = { root: 3.5, tip: 5.5, depth: 5, fillet: 1 };
 /** A trapezoid's flanks offset perpendicular to themselves, not sideways. */
-export const DOVETAIL_FLANK =
+const DOVETAIL_FLANK =
   Math.hypot(DOVETAIL.depth, DOVETAIL.tip - DOVETAIL.root) / DOVETAIL.depth;
+/** Points per dovetail fillet arc, both ends included. */
+export const DOVETAIL_ARC_PTS = 7;
+
+/** One rounded corner: tangent point in, arc midpoint, tangent point out. */
+export interface Fillet {
+  t0: Pair;
+  mid: Pair;
+  t1: Pair;
+  centre: Pair;
+  r: number;
+}
+
+/** Round the corner `v` between `a` and `b` (directions only) with radius `r`. */
+function filletAt(a: Pair, v: Pair, b: Pair, r: number): Fillet {
+  const unit = (p: Pair): Pair => {
+    const l = Math.hypot(p[0], p[1]);
+    return [p[0] / l, p[1] / l];
+  };
+  const d1 = unit([a[0] - v[0], a[1] - v[1]]);
+  const d2 = unit([b[0] - v[0], b[1] - v[1]]);
+  const half = Math.acos(Math.max(-1, Math.min(1, d1[0] * d2[0] + d1[1] * d2[1]))) / 2;
+  const t = r / Math.tan(half);
+  const bis = unit([d1[0] + d2[0], d1[1] + d2[1]]);
+  const centre: Pair = [v[0] + (bis[0] * r) / Math.sin(half), v[1] + (bis[1] * r) / Math.sin(half)];
+  return {
+    t0: [v[0] + d1[0] * t, v[1] + d1[1] * t],
+    t1: [v[0] + d2[0] * t, v[1] + d2[1] * t],
+    mid: [centre[0] - bis[0] * r, centre[1] - bis[1] * r],
+    centre,
+    r,
+  };
+}
+
+/**
+ * The dovetail's four fillets in walk order (root, tip, tip, root), as
+ * `[out, along]` like `toothProfile`. The straight runs between them are
+ * implicit; the ring closes along the seam line from the last root back to the
+ * first.
+ *
+ * The socket (`grow > 0`) is the exact offset of the tooth where it can be:
+ * flanks and tip move out by `grow`, and the tip fillets grow with them,
+ * concentric with the tooth's. The root is the exception. Its fillet stays at
+ * `fillet` and stays tangent to the seam line, because the two pieces abut
+ * there with no gap: the socket's rounded mouth is then the tooth's root wedge
+ * slid along the seam, which always fits inside it, and the clearance tapers to
+ * zero exactly where the flat faces meet.
+ */
+export function dovetailFillets(grow = 0): Fillet[] {
+  const { root, tip, depth, fillet } = DOVETAIL;
+  const d = depth + grow;
+  const r0 = root + grow * DOVETAIL_FLANK; // offset flank at the seam line
+  const t0 = r0 + ((tip - root) * d) / depth; // ...and at the offset tip line
+  const half = (s: number): Fillet[] => {
+    const rootV: Pair = [0, s * r0];
+    const tipV: Pair = [d, s * t0];
+    return [
+      filletAt([0, s * (r0 + 1)], rootV, tipV, fillet),
+      filletAt(rootV, tipV, [d, -s * t0], fillet + grow),
+    ];
+  };
+  const [a, b] = half(-1);
+  const [c, e] = half(1);
+  const flip = (f: Fillet): Fillet => ({ ...f, t0: f.t1, t1: f.t0 });
+  return [a, b, flip(e), flip(c)];
+}
+
+function sampleFillet(f: Fillet): Pair[] {
+  const a0 = Math.atan2(f.t0[1] - f.centre[1], f.t0[0] - f.centre[0]);
+  let sweep = Math.atan2(f.t1[1] - f.centre[1], f.t1[0] - f.centre[0]) - a0;
+  if (sweep > Math.PI) sweep -= 2 * Math.PI;
+  if (sweep < -Math.PI) sweep += 2 * Math.PI;
+  const n = DOVETAIL_ARC_PTS - 1;
+  return Array.from({ length: n + 1 }, (_, i) => {
+    const t = a0 + (sweep * i) / n;
+    return [f.centre[0] + f.r * Math.cos(t), f.centre[1] + f.r * Math.sin(t)] as Pair;
+  });
+}
 
 /** How far a tooth of this profile reaches into its neighbour. */
 export function toothDepth(joint: JointKind): number {
@@ -216,17 +298,7 @@ export function toothDepth(joint: JointKind): number {
  * subtlety here.
  */
 export function toothProfile(joint: JointKind, grow = 0): Pair[] {
-  if (joint === "dovetail") {
-    const root = DOVETAIL.root + grow * DOVETAIL_FLANK;
-    const tip = DOVETAIL.tip + grow * DOVETAIL_FLANK;
-    const d = DOVETAIL.depth + grow;
-    return [
-      [0, -root],
-      [d, -tip],
-      [d, tip],
-      [0, root],
-    ];
-  }
+  if (joint === "dovetail") return dovetailFillets(grow).flatMap(sampleFillet);
   const R = JIGSAW_R;
   const cap = R + grow;
   const fil = Math.max(0.05, R - grow);
@@ -511,7 +583,12 @@ export function pieceOutline(
         pts.push(place((own ? 1 : -1) * out, along));
       }
       verts.push(first, pts.length - 1);
-      if (split.joint === "dovetail") verts.push(first + 1, first + 2);
+      // Each fillet meets its flank or tip at a tangent edge, as in the B-rep.
+      if (split.joint === "dovetail") {
+        for (let k = 0; k < 4; k++) {
+          verts.push(first + k * DOVETAIL_ARC_PTS, first + (k + 1) * DOVETAIL_ARC_PTS - 1);
+        }
+      }
     }
   };
   const horiz = (s: SeamSide) => (s === "x0" ? p.c0 : p.c1);

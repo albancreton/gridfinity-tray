@@ -216,14 +216,23 @@ stored, so a resize re-plans for free and the bed stays the only state.
   single radius `JIGSAW_R` = 1.25: four arcs, all R, making a tab **8R along the seam, 3R
   deep, on a 4R neck** — a concave fillet out of the seam line, the head's semicircular cap,
   a flat tip, then the mirror. Head twice the neck is **2R of undercut per side**.
-  `dovetail` is root 7, tip 11, 5 deep. Depth is therefore per profile (`toothDepth(joint)`),
+  `dovetail` is root 7, tip 11, 5 deep, with **all four corners filleted R1**
+  (`DOVETAIL.fillet`, Nov 2026, for printability): `dovetailFillets(grow)` is the one
+  construction; the mesher samples it (`DOVETAIL_ARC_PTS` per arc) and the CAD draws the
+  same arcs exactly with `threePointsArcTo`. Depth is therefore per profile (`toothDepth(joint)`),
   which `pieceFootprintMm` and `planSplit` both need.
   Jigsaw engages **normal to the panel**, the same direction on every seam, so a 2×2 tiling
   drops together in any order; a dovetail only slides along its seam, so two perpendicular
   dovetail seams cannot both be assembled — it is the better joint for a **1-D split only**.
   Sockets are the same profile grown by `clearance` (0.15/face by default). Offsetting is the
   one subtlety: a **convex** arc grows with the offset and a **concave** one shrinks, and a
-  trapezoid's flanks move perpendicular to themselves, hence `DOVETAIL_FLANK`.
+  trapezoid's flanks move perpendicular to themselves, hence `DOVETAIL_FLANK` (the offset
+  tip corner is the offset flank ∩ offset tip line — not `tip + grow·FLANK`, which left the
+  flank's far end ~0.06mm tight). The dovetail's **root** fillet is the deliberate exception:
+  it stays R1 and tangent to the seam line instead of shrinking to R1−clearance, because the
+  pieces abut there with zero gap; the socket mouth is then the tooth's root wedge slid along
+  the seam, which always fits, and the clearance tapers to zero where the flat faces meet.
+  Tip fillets do offset exactly (R1+clearance, concentric).
 - **The teeth stand proud.** A piece's *outline* is `pieceSizeMm`, but what the bed must
   clear is `pieceFootprintMm` — outline plus `toothDepth(joint)` on every seam edge.
   `planSplit` and the Settings readout both use the footprint; a 15×11 on a 250×220 bed is
